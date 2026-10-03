@@ -101,7 +101,8 @@ export class WorkspaceService {
     if (!connection) throw new AppError("Google is disconnected", 409);
     const mail =
       this.config.mode === "sample"
-        ? (await this.db.list<Mail>(owner, "mail")).filter((m) => m.threadId === id)
+        ? // One thread, not a scan of every message the owner has.
+          await this.db.listWhere<Mail>(owner, "mail", "threadId", id)
         : await this.cacheMail(
             owner,
             await this.google(owner, connection.id).getThread(id),

@@ -169,12 +169,10 @@ export class AgentService {
       task,
       files: files.map((file) => this.files.signed(owner, file)),
       browsers: browsers.map((browser) => this.browser.decorate(owner, browser)),
-      events: (await this.db.list<RunEvent>(owner, "run-events"))
-        .filter((e) => e.taskId === id)
-        .sort((a, b) => a.date.localeCompare(b.date)),
-      artifacts: (await this.db.list<AgentArtifact>(owner, "agent-artifacts")).filter(
-        (a) => a.taskId === id,
-      ),
+      // Filtered in the database: these accumulate for every task the owner has
+      // ever run, so a full list would scan all of them to show one task.
+      events: await this.db.listWhere<RunEvent>(owner, "run-events", "taskId", id),
+      artifacts: await this.db.listWhere<AgentArtifact>(owner, "agent-artifacts", "taskId", id),
     };
   }
   async createTask(owner: string, raw: unknown, idempotencyKey?: string, held = false) {
