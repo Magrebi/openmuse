@@ -15,6 +15,15 @@ import {
   rgb,
   StandardFonts,
 } from "pdf-lib";
+import {
+  type ExtractPdfTextOptions,
+  extractPdfText,
+  MAX_TEXT_PER_PAGE,
+  type PdfPageText,
+} from "./pdf-text.ts";
+
+export type { PdfPageText };
+export { MAX_TEXT_PER_PAGE };
 
 const MAX_PDF_BYTES = 10 * 1024 * 1024;
 const MAX_PDF_PAGES = 500;
@@ -95,6 +104,21 @@ export async function inspectPdf(bytes: Uint8Array): Promise<PdfInspection> {
     const doc = await loadPdf(bytes);
     return { pageCount: doc.getPageCount(), fields: doc.getForm().getFields().map(inspectField) };
   }, "Cannot inspect PDF: the document contains malformed or unsupported form fields");
+}
+
+/**
+ * Read the text of a page range, reusing the same validation as every other
+ * operation so an unreadable document fails the same way whichever entry point
+ * is used.
+ */
+export async function readPdfText(
+  bytes: Uint8Array,
+  options: ExtractPdfTextOptions = {},
+): Promise<PdfPageText[]> {
+  return pdfOperation(
+    async () => extractPdfText(await loadPdf(bytes), options),
+    "Cannot read PDF text: the document is malformed or unsupported",
+  );
 }
 
 /** Strip action entry points in the new output; never execute PDF scripts. */

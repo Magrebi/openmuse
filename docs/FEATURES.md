@@ -12,7 +12,7 @@ The native and web agent core runs locally. This inventory describes the current
 | Browser | Persistent Chromium, public page reads, snapshots, console takeover, agent scroll/click/type with guarded input receipts, PDF downloads | Automatic checkout and per-person VM orchestration |
 | Linux computer | Nonroot Docker container, bounded bash/Python/Node/git commands, saved output and exit receipts, persistent workspace files, text editing, PDF import/export | Interactive terminal, desktop apps, controlled egress, disk quotas and stronger VM isolation |
 | Gmail / Calendar | Google OAuth; complete threads; saved drafts; calendar/event CRUD with reviewed versions | Live Google acceptance, recurrence editing, other connectors |
-| PDF job | Durable import, typed input request, filled-copy preview, reviewed reply, receipt | OCR/scanned forms and additional PDF field types |
+| PDF job | Durable import, typed input request, filled-copy preview, reviewed reply, receipt, and server-side text extraction (`read_pdf`) for owner-owned documents | OCR/scanned forms and additional PDF field types |
 | Generated results | Plans/reports/comparisons, finance CSV metrics, and scripts in the private Linux workspace | Managed tool installation/versioning and image/audio generation |
 | Notifications | Durable in-app inbox, source-linked change alerts, restart reconciliation | APNs/FCM/device push delivery |
 | Connectors | Searchable capability/status catalogue, Google connection, browser worker | Plaid, health, Instagram, WhatsApp and partner APIs |

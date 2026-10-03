@@ -27,7 +27,7 @@ The release is a personal-agent alpha: delegate a job, inspect its plan, supply 
 - [ ] Customer-service flows and carefully scoped purchase handoff, built on the agent-operated browsing already shipped. Autonomous checkout, payment and reservation booking remain out of scope.
 - [ ] Google Drive/Docs and individually validated social, bank, and health connectors.
 - [ ] Device push notifications, voice input/replies, and image generation.
-- [ ] OCR/scanned PDFs, more form types, and calendar recurrence editing.
+- [ ] OCR/scanned PDFs, more form types, and calendar recurrence editing. Text extraction from a PDF's own embedded text now ships as `read_pdf`; OCR of scanned pages and form-type coverage remain open.
 - [ ] Adaptive long-term plans, broader source-backed ideas, and a managed registry for generated tools.
 - [ ] Multi-user authentication, deployment hardening, retention/export controls, and operational recovery.
 
