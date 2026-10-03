@@ -1,4 +1,5 @@
 import { Platform } from "react-native";
+import { fetchWithTimeout, requestTimeoutMs } from "./http.ts";
 
 export const API_URL = (
   process.env.EXPO_PUBLIC_API_URL ||
@@ -8,7 +9,8 @@ export const API_URL = (
 export class MuseApi {
   constructor(readonly token: string) {}
   async request<T>(path: string, body?: unknown, method?: string): Promise<T> {
-    const response = await fetch(`${API_URL}${path}`, {
+    // Every request is bounded; an unanswered API must not hang a screen.
+    const response = await fetchWithTimeout(`${API_URL}${path}`, {
       method: method ?? (body === undefined ? "GET" : "POST"),
       headers: {
         Authorization: `Bearer ${this.token}`,
@@ -33,10 +35,12 @@ export class MuseApi {
 export async function createSession(
   accessKey?: string,
 ): Promise<{ token: string; mode: "sample" | "live" }> {
-  const response = await fetch(`${API_URL}/api/session`, {
+  const response = await fetchWithTimeout(`${API_URL}/api/session`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ accessKey }),
+    // Sign-in is the first call a person makes, so it fails fast and clearly.
+    timeoutMs: requestTimeoutMs,
   });
   const payload = await response.json();
   if (!response.ok) throw new Error(payload.error || "Could not open your workspace.");
