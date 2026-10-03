@@ -84,6 +84,23 @@ pnpm dev:web
 
 Open [localhost:8081](http://localhost:8081). The API runs at [localhost:8787/api/health](http://localhost:8787/api/health).
 
+### Desktop app (no terminal)
+
+Prefer not to use a terminal? The [desktop app](apps/desktop/README.md) is a
+control panel for the same deployment: it runs the prerequisite checks, starts
+and stops the stack, streams per-service logs, and opens this web app in a
+window.
+
+1. Download the OpenMuse installer for your platform from [releases](https://github.com/CopilotKit/OpenMuse/releases) and install Docker Desktop.
+2. Launch OpenMuse and point it at your OpenMuse folder.
+3. Follow the setup wizard. It generates the secrets, writes them to `.env`, and shows you a diff before saving. You will need a CopilotKit Intelligence key from `npx copilotkit@latest login`, and a model provider key if you want the agent to delegate.
+4. Press **Start**. The tray icon turns green when the API is healthy, then the web app opens.
+
+The wizard is re-runnable: it repairs a `.env` that is missing or incomplete and
+keeps any secret that is already valid. Stopping the stack never deletes your
+saved browser profiles or downloads. The desktop app changes no setting that you
+cannot also change in `.env` by hand.
+
 ### Try it
 
 1. In Chat, send **“Complete the permission slip”**. Open the task, supply fictional form values, inspect the saved PDF, and review the prepared reply. This writes only to the local mailbox.

@@ -8,7 +8,7 @@ The release is a personal-agent alpha: delegate a job, inspect its plan, supply 
 - Server-owned jobs, plans, checkpoints, leases, retries, cancellation, and action receipts.
 - Ideas with evidence, Goals, milestones, public-page tracking, and an in-app notification inbox.
 - Persistent Chromium sessions, public-page reading, screenshots, manual interaction, and PDF downloads.
-- Agent-operated interactive web pages: scroll, click and form filling behind a same-origin scope, a 25-action per-task budget, durable input receipts, and a gate that stops at any purchase or reservation step. Credential entry and transactional submit stay with the user.
+- Agent-operated interactive web pages: a search tool, page snapshots that describe links and controls as addressable elements, wait-for-page, multiple tabs, and scroll, click, fill, select, check, upload and history moves behind a same-origin scope, a 25-action per-task budget, durable input receipts, and a gate that stops at any purchase or reservation step. Credential entry and transactional submit stay with the user.
 - A private Docker Linux computer with bounded terminal commands, persistent workspace files, a text editor, PDF import/export, command receipts, and stop/restart recovery. Terminal networking is disabled.
 - PDF viewing and supported form filling, reviewed Gmail/Calendar adapters, CSV spending artifacts, identity, and editable memory.
 
@@ -22,7 +22,8 @@ The release is a personal-agent alpha: delegate a job, inspect its plan, supply 
 
 ## Product extensions
 
-- [ ] Interactive terminal sessions, desktop applications, per-person VM orchestration, controlled network access, and workspace disk quotas. The current [Linux computer](docs/COMPUTER.md) supports one owner per deployment.
+- [ ] Interactive terminal sessions, per-person VM orchestration, controlled network access, and workspace disk quotas. The current [Linux computer](docs/COMPUTER.md) supports one owner per deployment.
+- [x] Desktop applications. A Tauri control panel ships the implemented slices: a health-state contract with one state machine driving the tray, status page and notifications; start/stop/health/logs over `docker compose`; a prerequisite check with one-line fixes; a re-runnable setup wizard that writes `.env` in place behind a diff; and a system tray with OS notifications. Canonical state stays in `.env`, the Compose files and the API. Mobile QR pairing and approval notifications are not implemented; see [apps/desktop](apps/desktop/README.md).
 - [ ] Customer-service flows and carefully scoped purchase handoff, built on the agent-operated browsing already shipped. Autonomous checkout, payment and reservation booking remain out of scope.
 - [ ] Google Drive/Docs and individually validated social, bank, and health connectors.
 - [ ] Device push notifications, voice input/replies, and image generation.

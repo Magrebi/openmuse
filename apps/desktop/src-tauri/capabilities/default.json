@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "The control panel's own capabilities. There is no filesystem, shell or HTTP plugin permission: every effect goes through this app's own commands, which confine paths to the repository and never build a shell string.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

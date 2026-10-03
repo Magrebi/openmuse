@@ -13,9 +13,9 @@
     "dev:demo": "tsx apps/server/src/demo/entry.ts",
     "dev:mobile": "pnpm --dir apps/mobile start",
     "dev:web": "pnpm --dir apps/mobile web",
-    "test": "tsx --test tests/*.test.ts apps/mobile/test/*.test.ts",
+    "test": "tsx --test tests/*.test.ts apps/mobile/test/*.test.ts apps/desktop/test/*.test.ts",
     "test:browser": "node --experimental-strip-types --test apps/worker/tests/lifecycle.test.ts",
-    "typecheck": "tsc --noEmit && pnpm --dir apps/mobile typecheck",
+    "typecheck": "tsc --noEmit && pnpm --dir apps/mobile typecheck && pnpm --dir apps/desktop typecheck",
     "lint": "biome check .",
     "format": "biome check --write .",
     "build:server": "tsc -p tsconfig.build.json",
@@ -26,7 +26,9 @@
     "dev:worker": "tsx apps/server/src/worker-entry.ts",
     "start:worker": "node dist/apps/server/src/worker-entry.js",
     "dev:browser": "node --env-file=.env --import tsx apps/worker/src/index.ts",
-    "test:computer": "tsx --test apps/computer/smoke.test.ts"
+    "test:computer": "tsx --test apps/computer/smoke.test.ts",
+    "tauri:dev": "pnpm --dir apps/desktop tauri dev",
+    "tauri:build": "pnpm --dir apps/desktop tauri build"
   },
   "dependencies": {
     "@ag-ui/client": "0.0.59",

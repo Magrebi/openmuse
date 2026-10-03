@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>OpenMuse</title>
+    <link rel="stylesheet" href="./app.css" />
+  </head>
+  <body>
+    <header class="bar">
+      <h1>OpenMuse</h1>
+      <span id="state" class="pill" data-tone="gray">unknown</span>
+    </header>
+
+    <p id="reason" class="reason" hidden></p>
+
+    <nav class="actions">
+      <button id="start" type="button">Start</button>
+      <button id="stop" type="button">Stop</button>
+      <button id="open" type="button">Open web app</button>
+      <button id="setup" type="button" class="ghost">Setup wizard</button>
+    </nav>
+
+    <main>
+      <section id="checks" aria-labelledby="checks-title">
+        <h2 id="checks-title">Before you start</h2>
+        <ul id="check-list" class="checks"></ul>
+      </section>
+
+      <section id="wizard" aria-labelledby="wizard-title" hidden>
+        <h2 id="wizard-title">Setup wizard</h2>
+        <p class="hint">
+          This writes <code>.env</code> in your OpenMuse folder. Existing secrets are kept
+          unless you replace them.
+        </p>
+        <label for="provider">Model provider</label>
+        <select id="provider">
+          <option value="openai">OpenAI</option>
+          <option value="anthropic">Anthropic</option>
+          <option value="google">Google</option>
+        </select>
+
+        <label for="model">Model</label>
+        <input id="model" type="text" value="gpt-5" autocomplete="off" />
+
+        <label for="provider-key">Provider key</label>
+        <input id="provider-key" type="password" autocomplete="off" />
+
+        <label for="intelligence">CopilotKit Intelligence key</label>
+        <input id="intelligence" type="password" autocomplete="off" />
+
+        <div class="row">
+          <button id="save" type="button">Save to .env</button>
+          <button id="cancel" type="button" class="ghost">Cancel</button>
+        </div>
+        <p id="generated" class="hint" hidden></p>
+      </section>
+
+      <section aria-labelledby="logs-title">
+        <h2 id="logs-title">Logs</h2>
+        <div class="tabs" role="tablist">
+          <button type="button" role="tab" data-service="api" aria-selected="true">API</button>
+          <button type="button" role="tab" data-service="web">Web</button>
+          <button type="button" role="tab" data-service="browser-worker">Browser worker</button>
+        </div>
+        <pre id="log" class="log" aria-live="polite"></pre>
+      </section>
+    </main>
+
+    <script type="module" src="./ui/main.js"></script>
+  </body>
+</html>

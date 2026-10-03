@@ -3,15 +3,24 @@ import test from "node:test";
 import {
   BROWSER_INPUT_BUDGET,
   BrowserInputGuard,
-  browserInputSchema,
+  browserWireInputSchema,
+  clickAnyInputSchema,
   clickInputSchema,
   containsSecret,
   keyInputSchema,
   looksCredentialed,
   looksTransactional,
+  MAX_DELAY,
+  MAX_TABS,
   originOf,
+  refSchema,
+  refusesFill,
   scrollInputSchema,
+  searchQuerySchema,
+  tabsInputSchema,
   typeInputSchema,
+  uploadFileNameSchema,
+  waitInputSchema,
 } from "../apps/server/src/engine/browser-input.ts";
 
 test("input schemas mirror the worker's own bounds", () => {
@@ -34,24 +43,105 @@ test("input schemas mirror the worker's own bounds", () => {
 });
 
 test("the wire schema cannot smuggle a second action into one payload", () => {
-  assert.equal(browserInputSchema.safeParse({ type: "scroll", deltaY: 600 }).success, true);
-  assert.equal(browserInputSchema.safeParse({ type: "key", key: "Enter" }).success, true);
-  // Unknown keys are stripped rather than rejected, so a scroll can never carry a key
-  // press and a click can never carry text.
+  // Everything the API accepts goes through the wire schema, which is what a takeover
+  // console and the agent both send.
+  assert.equal(browserWireInputSchema.safeParse({ type: "scroll", deltaY: 600 }).success, true);
+  assert.equal(browserWireInputSchema.safeParse({ type: "key", key: "Enter" }).success, true);
+  // A flat action strips unknown keys, so a scroll can never carry a key press.
   assert.deepEqual(
-    browserInputSchema.parse({ type: "scroll", deltaY: 600, key: "Enter", text: "x" }),
+    browserWireInputSchema.parse({ type: "scroll", deltaY: 600, key: "Enter", text: "x" }),
     { type: "scroll", deltaY: 600 },
   );
-  assert.deepEqual(browserInputSchema.parse({ type: "click", x: 5, y: 5, text: "smuggled" }), {
-    type: "click",
-    x: 5,
-    y: 5,
-  });
-  assert.equal(browserInputSchema.safeParse({ type: "click", x: 5 }).success, false);
+  // The union branches are strict, so a click that also carries text is refused outright
+  // rather than resolved to whichever branch happens to fit.
   assert.equal(
-    browserInputSchema.safeParse({ type: "navigate", url: "https://x.example" }).success,
+    browserWireInputSchema.safeParse({ type: "click", x: 5, y: 5, text: "smuggled" }).success,
     false,
   );
+  assert.equal(browserWireInputSchema.safeParse({ type: "click", x: 5 }).success, false);
+  assert.equal(
+    browserWireInputSchema.safeParse({ type: "navigate", url: "https://x.example" }).success,
+    false,
+  );
+  // A fill carries a ref and text, and nothing else that could act.
+  assert.deepEqual(
+    browserWireInputSchema.parse({ type: "fill", ref: "e4", text: "hi", x: 5, y: 5 }),
+    { type: "fill", ref: "e4", text: "hi" },
+  );
+  assert.equal(browserWireInputSchema.safeParse({ type: "fill", text: "hi" }).success, false);
+  assert.equal(browserWireInputSchema.safeParse({ type: "nav", to: "back" }).success, true);
+  assert.equal(
+    browserWireInputSchema.safeParse({ type: "nav", to: "https://x.example" }).success,
+    false,
+  );
+  // An upload names a file; it cannot smuggle a path or an action alongside.
+  assert.deepEqual(
+    browserWireInputSchema.parse({ type: "upload", ref: "e1", file: "invoice.pdf" }),
+    { type: "upload", ref: "e1", file: "invoice.pdf" },
+  );
+  assert.equal(
+    browserWireInputSchema.safeParse({ type: "upload", ref: "e1", file: "../secret.pdf" }).success,
+    false,
+  );
+});
+
+test("an element ref is accepted only in the shape a snapshot issues", () => {
+  for (const ref of ["e1", "e12", "e200", "e999"])
+    assert.equal(refSchema.safeParse(ref).success, true, ref);
+  for (const ref of [
+    "",
+    "e",
+    "e0",
+    "e01",
+    "e1000",
+    "E1",
+    " e1",
+    "e1 ",
+    "a1",
+    "#e1",
+    '"; drop"',
+    "[data-openmuse-ref=e1]",
+    1,
+    null,
+    undefined,
+  ])
+    assert.equal(refSchema.safeParse(ref).success, false, JSON.stringify(ref));
+  // A click takes one addressing mode or the other, never an ambiguous mixture.
+  assert.equal(clickAnyInputSchema.safeParse({ ref: "e1" }).success, true);
+  assert.equal(clickAnyInputSchema.safeParse({ x: 5, y: 5 }).success, true);
+  assert.equal(clickAnyInputSchema.safeParse({ ref: "e1", x: 5, y: 5 }).success, false);
+  assert.equal(clickAnyInputSchema.safeParse({ x: 5 }).success, false);
+  assert.equal(clickAnyInputSchema.safeParse({}).success, false);
+  // The tool-facing shape carries no `type`; the wire schema below adds it, so a model
+  // cannot name the action itself.
+  assert.equal(clickAnyInputSchema.safeParse({ type: "click", x: 5, y: 5 }).success, false);
+});
+
+test("a search query is bounded and cannot be empty", () => {
+  assert.equal(searchQuerySchema.safeParse("usb c charger").success, true);
+  assert.equal(searchQuerySchema.safeParse("  spaced  ").success, true);
+  assert.equal(searchQuerySchema.safeParse("a".repeat(300)).success, true);
+  assert.equal(searchQuerySchema.safeParse("a".repeat(301)).success, false);
+  assert.equal(searchQuerySchema.safeParse("").success, false);
+  assert.equal(searchQuerySchema.safeParse("   ").success, false);
+});
+
+test("a password field is refused a fill by the same rule the worker applies", () => {
+  assert.equal(refusesFill("textbox", "Password", true), true);
+  assert.equal(refusesFill("textbox", "PIN", false), true);
+  assert.equal(refusesFill("textbox", "One-time code", false), true);
+  assert.equal(refusesFill("textbox", "CVV", false), true);
+  assert.equal(refusesFill("textbox", "Email address", false), false);
+  // A word like "pin" buried inside a longer word is not a credential field.
+  assert.equal(refusesFill("textbox", "Shipping address", false), false);
+  assert.equal(refusesFill("textbox", "Coupon code", false), false);
+  // A text box whose label mentions a password is refused even when the page did not
+  // mark it as one: over-refusing costs the user one retry, under-refusing would type a
+  // secret into the page.
+  assert.equal(refusesFill("textbox", "Password reset help", false), true);
+  // Only a textbox can hold a secret; a button labelled "Forgot password" is not one.
+  assert.equal(refusesFill("button", "Forgot password", false), false);
+  assert.equal(refusesFill("link", "Reset your password", false), false);
 });
 
 test("a session becomes operable as soon as it is observed", () => {
@@ -184,6 +274,103 @@ test("re-observing clears the stored uncertainty instead of leaving it to block 
   const merged = { ...resumed, ...resumed.adopt("session-1", "https://shop.example/product") };
   assert.equal(merged.browserInputUncertain, "");
   assert.equal(new BrowserInputGuard(merged).isUncertain, false);
+});
+
+test("a wait is an observation and an upload names a plain file", () => {
+  for (const value of [
+    { until: "idle" },
+    { until: "text" },
+    { until: "element", ref: "e2" },
+    { until: "delay", ms: 0 },
+    { until: "delay", ms: MAX_DELAY },
+  ])
+    assert.equal(waitInputSchema.safeParse(value).success, true, JSON.stringify(value));
+  // Each verb carries only its own parameter, so a wait cannot smuggle a selector or a
+  // ref into the form that does not use one.
+  assert.equal(waitInputSchema.safeParse({ until: "idle", ref: "e1" }).success, false);
+  assert.equal(waitInputSchema.safeParse({ until: "element" }).success, false);
+  assert.equal(waitInputSchema.safeParse({ until: "delay", ms: MAX_DELAY + 1 }).success, false);
+  assert.equal(waitInputSchema.safeParse({ until: "idle", selector: "div" }).success, false);
+  // The tool-facing shape carries no `type`; the wire schema adds it.
+  assert.equal(waitInputSchema.safeParse({ type: "wait", until: "idle" }).success, false);
+  for (const file of ["invoice.pdf", "Tax Return 2026.pdf"])
+    assert.equal(uploadFileNameSchema.safeParse(file).success, true, file);
+  for (const file of [
+    "",
+    "../secret.pdf",
+    "../../etc/passwd",
+    "/etc/passwd",
+    "dir/file.pdf",
+    "~/notes.pdf",
+    "noextension",
+  ])
+    assert.equal(uploadFileNameSchema.safeParse(file).success, false, JSON.stringify(file));
+});
+
+test("tab actions carry exactly what their verb needs", () => {
+  assert.equal(tabsInputSchema.safeParse({ action: "list" }).success, true);
+  assert.equal(
+    tabsInputSchema.safeParse({ action: "open", url: "https://example.com/" }).success,
+    true,
+  );
+  assert.equal(tabsInputSchema.safeParse({ action: "switch", index: 0 }).success, true);
+  assert.equal(tabsInputSchema.safeParse({ action: "close", index: 7 }).success, true);
+  // `open` needs a public web address; a script or local path is not one.
+  assert.equal(tabsInputSchema.safeParse({ action: "open" }).success, false);
+  assert.equal(
+    tabsInputSchema.safeParse({ action: "open", url: "javascript:alert(1)" }).success,
+    false,
+  );
+  assert.equal(
+    tabsInputSchema.safeParse({ action: "open", url: "file:///etc/passwd" }).success,
+    false,
+  );
+  assert.equal(tabsInputSchema.safeParse({ action: "switch" }).success, false);
+  assert.equal(tabsInputSchema.safeParse({ action: "switch", index: -1 }).success, false);
+  assert.equal(tabsInputSchema.safeParse({ action: "switch", index: MAX_TABS }).success, false);
+  assert.equal(tabsInputSchema.safeParse({ action: "list", index: 0 }).success, false);
+  assert.equal(tabsInputSchema.safeParse({ action: "wipe", index: 0 }).success, false);
+});
+
+test("the wire schema admits wait and click-by-ref without loosening anything else", () => {
+  assert.deepEqual(browserWireInputSchema.parse({ type: "wait", until: "idle" }), {
+    type: "wait",
+    until: "idle",
+  });
+  assert.deepEqual(browserWireInputSchema.parse({ type: "wait", until: "element", ref: "e3" }), {
+    type: "wait",
+    until: "element",
+    ref: "e3",
+  });
+  assert.deepEqual(browserWireInputSchema.parse({ type: "wait", until: "delay", ms: 10 }), {
+    type: "wait",
+    until: "delay",
+    ms: 10,
+  });
+  assert.deepEqual(browserWireInputSchema.parse({ type: "click", ref: "e1" }), {
+    type: "click",
+    ref: "e1",
+  });
+  assert.deepEqual(browserWireInputSchema.parse({ type: "click", x: 5, y: 6 }), {
+    type: "click",
+    x: 5,
+    y: 6,
+  });
+  // The strict wait branch must not become a way to carry a second action.
+  assert.equal(
+    browserWireInputSchema.safeParse({ type: "wait", until: "idle", ref: "e1", selector: "div" })
+      .success,
+    false,
+  );
+  assert.equal(browserWireInputSchema.safeParse({ type: "wait", until: "element" }).success, false);
+  assert.equal(
+    browserWireInputSchema.safeParse({ type: "upload", ref: "e1", file: "../x.pdf" }).success,
+    false,
+  );
+  assert.equal(
+    browserWireInputSchema.safeParse({ type: "click", ref: "e1", x: 5, y: 6 }).success,
+    false,
+  );
 });
 
 test("origins are compared by scheme, host and port", () => {

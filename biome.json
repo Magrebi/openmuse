@@ -10,7 +10,9 @@
       "!**/ios",
       "!**/android",
       "!**/.openmuse",
-      "!**/artifacts"
+      "!**/artifacts",
+      "!apps/desktop/src-tauri/target",
+      "!apps/desktop/src-tauri/gen"
     ]
   },
   "formatter": { "enabled": true, "indentStyle": "space", "lineWidth": 100 },

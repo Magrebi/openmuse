@@ -20,10 +20,16 @@ type Page = { url: string; title: string; text: string };
  * A minimal in-memory worker: it records the input the agent asked for and serves the
  * page each action should land on, so the tool guards are exercised end to end.
  */
+/**
+ * A minimal in-memory worker: it records the input the agent asked for and serves the
+ * page each action should land on, so the tool guards are exercised end to end. `extra`
+ * lets a test answer newer endpoints (snapshot, search) without duplicating this paging.
+ */
 function agentBrowser(
   t: Parameters<typeof browserFixture>[0],
   pages: Page[],
   inputs: { body: Record<string, unknown> }[],
+  extra?: (path: string, body: Record<string, unknown>) => { data: unknown } | undefined,
 ) {
   let index = 0;
   let sessionId = "";
@@ -35,8 +41,17 @@ function agentBrowser(
     updatedAt: new Date().toISOString(),
   });
   return browserFixture(t, (path, body) => {
+    const served = extra?.(path, body);
+    if (served) return served;
     if (path === "/sessions") {
       sessionId = String(body.id);
+      const match = pages.findIndex((page) => page.url === body.url);
+      if (match >= 0) index = match;
+      return { data: session() };
+    }
+    // Re-reading an existing session navigates rather than creating one, so the fixture
+    // has to move its page cursor here too or a later read returns the wrong page.
+    if (path.endsWith("/navigate")) {
       const match = pages.findIndex((page) => page.url === body.url);
       if (match >= 0) index = match;
       return { data: session() };
@@ -48,6 +63,20 @@ function agentBrowser(
       return { data: session() };
     }
     if (path.endsWith("/read")) return { data: { ...pages[index], truncated: false } };
+    // A snapshot is the same page plus the addressable model the agent acts on. Tests that
+    // care about a specific element shape pass `extra`; the rest get a plain one.
+    if (path.endsWith("/snapshot")) {
+      const served = extra?.(path, body);
+      if (served) return served;
+      return {
+        data: {
+          ...pages[index],
+          truncated: false,
+          elements: [],
+          links: [],
+        },
+      };
+    }
     throw new Error(`Unexpected browser path: ${path}`);
   });
 }
@@ -330,6 +359,236 @@ test("an input the worker fails is recorded as uncertain and is never replayed",
   assert.match(receipt.excerpt, /Worker unavailable/);
   assert.match(String(saved.state.browserInputUncertain), /^click: /);
   assert.equal(saved.state.browserInputSpent, undefined, "an uncertain action is not respendable");
+});
+
+test("the agent searches, snapshots and acts on element refs instead of guessing coordinates", async (t) => {
+  const inputs: { body: Record<string, unknown> }[] = [];
+  const paths: string[] = [];
+  const pages = [
+    { url: "https://shop.example/p/65w-charger", title: "65W USB-C Charger", text: "$19.99" },
+  ];
+  const browser = await agentBrowser(t, pages, inputs, (path, body) => {
+    paths.push(path);
+    if (path === "/search")
+      return {
+        data: {
+          query: String(body.query),
+          url: "https://duckduckgo.example/html",
+          results: [
+            {
+              title: "65W USB-C charger",
+              href: "https://shop.example/p/65w-charger",
+              snippet: "$19.99",
+            },
+          ],
+        },
+      };
+    if (path.endsWith("/snapshot"))
+      return {
+        data: {
+          url: pages[0].url,
+          title: pages[0].title,
+          text: pages[0].text,
+          truncated: false,
+          elements: [
+            { ref: "e1", role: "link", name: "Specifications", href: "/specs" },
+            { ref: "e2", role: "combobox", name: "Quantity", options: ["1", "2"] },
+          ],
+          links: [{ text: "Specifications", href: "/specs" }],
+        },
+      };
+    return undefined;
+  });
+  const calls: { name: string; arguments: object }[] = [
+    { name: "search_web", arguments: { query: "65w usb c charger" } },
+    { name: "read_web", arguments: { url: "https://shop.example/p/65w-charger" } },
+    { name: "browser_snapshot", arguments: {} },
+    { name: "browser_click", arguments: { ref: "e1" } },
+    { name: "browser_select", arguments: { ref: "e2", value: "2" } },
+    { name: "browser_back", arguments: { to: "back" } },
+    { name: "finish_task", arguments: { summary: "Reported the charger." } },
+  ];
+  await modelFixture(t, (index) => calls[index]);
+  const app = await createApp(browser.db, {
+    ...browser.config,
+    agentBackend: "model",
+    model: "openai/fixture",
+  });
+  t.after(() => app.agent.stop());
+  const task = await app.agent.createTask("owner", {
+    prompt: "Find a 65W USB-C charger and check its specs.",
+  });
+  await app.agent.worker.tick();
+
+  const saved = await app.agent.getTask("owner", task.id);
+  assert.equal(saved.status, "succeeded", saved.error ?? saved.question);
+  assert.ok(paths.includes("/search"), "the agent could discover a page it was not given");
+  // Every element-addressed action reaches the worker under its own type, and each spends
+  // the same budget a coordinate click would.
+  assert.deepEqual(
+    inputs.map((item) => item.body),
+    [
+      { type: "activate", ref: "e1" },
+      { type: "select", ref: "e2", value: "2" },
+      { type: "nav", to: "back" },
+    ],
+  );
+  const receipts = saved.evidence.filter((item) => item.kind === "browser_input");
+  assert.deepEqual(
+    receipts.map((item) => item.action),
+    ["activate", "select", "nav"],
+  );
+  assert.equal(saved.state.browserInputSpent, 3);
+});
+
+test("a fill into a password field is refused before the page is touched", async (t) => {
+  const inputs: { body: Record<string, unknown> }[] = [];
+  const pages = [{ url: "https://shop.example/account", title: "Account", text: "Sign in" }];
+  const browser = await agentBrowser(t, pages, inputs, (path) => {
+    if (path.endsWith("/snapshot"))
+      return {
+        data: {
+          url: pages[0].url,
+          title: pages[0].title,
+          text: pages[0].text,
+          truncated: false,
+          elements: [
+            { ref: "e1", role: "textbox", name: "Email address" },
+            { ref: "e2", role: "textbox", name: "Password", password: true },
+          ],
+          links: [],
+        },
+      };
+    return undefined;
+  });
+  const calls: { name: string; arguments: object }[] = [
+    { name: "read_web", arguments: { url: "https://shop.example/account" } },
+    { name: "browser_snapshot", arguments: {} },
+    { name: "browser_fill", arguments: { ref: "e2", text: "hunter2" } },
+    { name: "browser_fill", arguments: { ref: "e1", text: "murat@example.com" } },
+    { name: "finish_task", arguments: { summary: "Filled only the email field." } },
+  ];
+  await modelFixture(t, (index) => calls[index]);
+  const app = await createApp(browser.db, {
+    ...browser.config,
+    agentBackend: "model",
+    model: "openai/fixture",
+  });
+  t.after(() => app.agent.stop());
+  const task = await app.agent.createTask("owner", { prompt: "Fill in the sign-in form." });
+  await app.agent.worker.tick();
+
+  const saved = await app.agent.getTask("owner", task.id);
+  assert.equal(saved.status, "succeeded", saved.error ?? saved.question);
+  assert.deepEqual(
+    inputs.map((item) => item.body),
+    [{ type: "fill", ref: "e1", text: "murat@example.com" }],
+    "only the non-credential field reached the page",
+  );
+  const acted = saved.evidence.filter((item) => item.kind === "browser_input");
+  assert.equal(acted.length, 1, "the refused fill left no receipt because it never acted");
+});
+
+test("the agent waits for a page to arrive and that costs no action budget", async (t) => {
+  const inputs: { body: Record<string, unknown> }[] = [];
+  const pages = [
+    { url: "https://shop.example/p/65w-charger", title: "65W USB-C Charger", text: "$19.99" },
+  ];
+  const browser = await agentBrowser(t, pages, inputs);
+  const calls: { name: string; arguments: object }[] = [
+    { name: "read_web", arguments: { url: "https://shop.example/p/65w-charger" } },
+    { name: "browser_click", arguments: { ref: "e1" } },
+    // The page has not rendered yet, so the agent lets it settle before reading again.
+    { name: "browser_wait", arguments: { until: "idle" } },
+    { name: "browser_wait", arguments: { until: "element", ref: "e2" } },
+    { name: "browser_snapshot", arguments: {} },
+    { name: "finish_task", arguments: { summary: "Waited, then read the settled page." } },
+  ];
+  await modelFixture(t, (index) => calls[index]);
+  const app = await createApp(browser.db, {
+    ...browser.config,
+    agentBackend: "model",
+    model: "openai/fixture",
+  });
+  t.after(() => app.agent.stop());
+  const task = await app.agent.createTask("owner", { prompt: "Open a product and read it." });
+  await app.agent.worker.tick();
+
+  const saved = await app.agent.getTask("owner", task.id);
+  assert.equal(saved.status, "succeeded", saved.error ?? saved.question);
+  // Every action reached the worker under its own name.
+  assert.deepEqual(
+    inputs.map((item) => item.body.type),
+    ["activate", "wait", "wait"],
+  );
+  // Only the click is an interaction; waiting is an observation and spends nothing.
+  assert.equal(saved.state.browserInputSpent, 1);
+  const receipts = saved.evidence.filter((item) => item.kind === "browser_input");
+  assert.deepEqual(
+    receipts.map((item) => item.action),
+    ["activate", "wait", "wait"],
+  );
+  assert.equal(
+    receipts.every((item) => item.uncertain === false),
+    true,
+  );
+});
+
+test("the agent switches tabs to compare two sources", async (t) => {
+  const inputs: { body: Record<string, unknown> }[] = [];
+  const tabCalls: { body: Record<string, unknown> }[] = [];
+  // Both sources must exist in the fixture's page list, otherwise a read for the second
+  // address finds no page and silently returns the first.
+  const pages = [
+    { url: "https://a.example/one", title: "Source one", text: "one" },
+    { url: "https://b.example/two", title: "Source two", text: "two" },
+  ];
+  const browser = await agentBrowser(t, pages, inputs, (path, body) => {
+    if (path !== "/tabs") return undefined;
+    tabCalls.push({ body });
+    const action = String(body.action);
+    const list = [
+      { url: "https://a.example/one", title: "Source one" },
+      { url: "https://b.example/two", title: "Source two" },
+    ];
+    if (action === "open") return { data: { active: 1, tabs: list } };
+    if (action === "switch") return { data: { active: 0, tabs: list } };
+    if (action === "list") return { data: { active: 0, tabs: [list[0]] } };
+    return { data: { active: 0, tabs: [list[0]] } };
+  });
+  // `read_web` opens the address it is given in the session, so after the tab is opened the
+  // agent reads the second source through the second tab rather than by switching first.
+  const calls: { name: string; arguments: object }[] = [
+    { name: "read_web", arguments: { url: "https://a.example/one" } },
+    { name: "browser_tabs", arguments: { action: "open", url: "https://b.example/two" } },
+    { name: "read_web", arguments: { url: "https://b.example/two" } },
+    { name: "browser_tabs", arguments: { action: "list" } },
+    { name: "finish_task", arguments: { summary: "Compared both sources." } },
+  ];
+  await modelFixture(t, (index) => calls[index]);
+  const app = await createApp(browser.db, {
+    ...browser.config,
+    agentBackend: "model",
+    model: "openai/fixture",
+  });
+  t.after(() => app.agent.stop());
+  const task = await app.agent.createTask("owner", { prompt: "Compare two sources." });
+  await app.agent.worker.tick();
+
+  const saved = await app.agent.getTask("owner", task.id);
+  assert.equal(saved.status, "succeeded", saved.error ?? saved.question);
+  assert.deepEqual(
+    tabCalls.map((item) => item.body.action),
+    ["open", "list"],
+  );
+  // Switching tabs is an observation, not page input, so nothing was ever spent.
+  assert.equal(saved.state.browserInputSpent, undefined);
+  const observations = saved.evidence.filter((item) => item.kind === "web");
+  assert.deepEqual(
+    observations.map((item) => item.url),
+    ["https://a.example/one", "https://b.example/two"],
+    "both sources were read, the second through the tab the agent opened",
+  );
 });
 
 test("the agent can scroll and click a product page, and stops at checkout", async (t) => {

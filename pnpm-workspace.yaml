@@ -1,6 +1,7 @@
 packages:
   - apps/mobile
   - apps/worker
+  - apps/desktop
 allowBuilds:
   esbuild: true
   '@biomejs/biome': true

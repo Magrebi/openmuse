@@ -1,0 +1,160 @@
+:root {
+  color-scheme: light dark;
+  --ink: #121821;
+  --mint: #7cf2c4;
+  --muted: #5b6673;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+body {
+  margin: 0;
+  padding: 1.25rem;
+  background: Canvas;
+  color: var(--ink);
+  line-height: 1.5;
+}
+
+.bar {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+h1 {
+  font-size: 1.15rem;
+  margin: 0;
+}
+
+h2 {
+  font-size: 0.95rem;
+  margin: 1.5rem 0 0.5rem;
+}
+
+.pill {
+  border-radius: 999px;
+  padding: 0.15rem 0.7rem;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: #fff;
+  background: #8b95a1;
+}
+
+.pill[data-tone="green"] {
+  background: #16794f;
+}
+.pill[data-tone="amber"] {
+  background: #9a6700;
+}
+.pill[data-tone="red"] {
+  background: #b42318;
+}
+
+.reason {
+  margin: 0.75rem 0 0;
+  padding: 0.6rem 0.75rem;
+  border-left: 3px solid var(--mint);
+  background: color-mix(in srgb, var(--mint) 12%, transparent);
+}
+
+.actions,
+.row {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 1rem;
+  flex-wrap: wrap;
+}
+
+button {
+  font: inherit;
+  padding: 0.45rem 0.9rem;
+  border-radius: 8px;
+  border: 1px solid color-mix(in srgb, var(--ink) 20%, transparent);
+  background: var(--ink);
+  color: #fff;
+  cursor: pointer;
+}
+
+button.ghost {
+  background: transparent;
+  color: inherit;
+}
+
+button[disabled] {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+label {
+  display: block;
+  margin-top: 0.75rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+input,
+select {
+  width: 100%;
+  max-width: 26rem;
+  font: inherit;
+  padding: 0.45rem 0.6rem;
+  border-radius: 8px;
+  border: 1px solid color-mix(in srgb, var(--ink) 20%, transparent);
+  background: Field;
+  color: FieldText;
+}
+
+.hint {
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.checks {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.35rem;
+}
+
+.checks li {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  font-size: 0.9rem;
+  border-bottom: 1px solid color-mix(in srgb, var(--ink) 10%, transparent);
+  padding-bottom: 0.3rem;
+}
+
+.checks .failed {
+  color: #b42318;
+  font-weight: 600;
+}
+
+.tabs {
+  display: flex;
+  gap: 0.35rem;
+}
+
+.tabs button {
+  background: transparent;
+  color: inherit;
+  border-color: color-mix(in srgb, var(--ink) 15%, transparent);
+}
+
+.tabs button[aria-selected="true"] {
+  background: var(--ink);
+  color: #fff;
+}
+
+.log {
+  margin: 0.5rem 0 0;
+  padding: 0.75rem;
+  max-height: 18rem;
+  overflow: auto;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--ink) 6%, transparent);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.78rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

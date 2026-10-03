@@ -5,7 +5,7 @@ import type { Auth } from "./auth.ts";
 import { browserConsole } from "./browser-console.ts";
 import type { Config } from "./config.ts";
 import type { Store } from "./db.ts";
-import { browserInputSchema, UNSUPPORTED_INPUT_MESSAGE } from "./engine/browser-input.ts";
+import { browserWireInputSchema, UNSUPPORTED_INPUT_MESSAGE } from "./engine/browser-input.ts";
 import { AppError } from "./errors.ts";
 import type { Files } from "./files.ts";
 
@@ -21,6 +21,42 @@ const readSchema = z.object({
   title: z.string().max(300),
   text: z.string().max(100_000),
   truncated: z.boolean(),
+});
+/** One addressable element of the page, as the worker's snapshot described it. */
+const elementSchema = z.object({
+  ref: z.string().regex(/^e[1-9][0-9]{0,2}$/),
+  role: z.enum(["link", "button", "textbox", "checkbox", "radio", "combobox"]),
+  name: z.string().max(400),
+  value: z.string().max(400).optional(),
+  password: z.boolean().optional(),
+  checked: z.boolean().optional(),
+  disabled: z.boolean().optional(),
+  href: z.string().max(2000).optional(),
+  options: z.array(z.string().max(400)).max(60).optional(),
+});
+const snapshotSchema = readSchema.extend({
+  elements: z.array(elementSchema).max(300),
+  links: z.array(z.object({ text: z.string().max(400), href: z.string().max(2000) })).max(400),
+});
+const searchSchema = z.object({
+  query: z.string().max(300),
+  url: z.string(),
+  results: z
+    .array(
+      z.object({
+        title: z.string().max(400),
+        href: z.string().max(2000),
+        snippet: z.string().max(700),
+      }),
+    )
+    .max(30),
+});
+const tabsSchema = z.object({
+  active: z.number().int().min(0),
+  tabs: z
+    .array(z.object({ url: z.string().max(2000), title: z.string().max(300) }))
+    .min(1)
+    .max(8),
 });
 const failureSchema = z.object({
   id: z.string(),
@@ -172,6 +208,45 @@ export class BrowserService {
   read(owner: string, id: string) {
     return this.serial(id, () => this.readOwned(owner, id));
   }
+  /**
+   * Reads the page as an addressable model: text plus the elements the agent may act on.
+   * This is the observation every element-addressed action depends on, so it is
+   * serialised on the same session queue as input to keep refs and actions in order.
+   */
+  snapshot(owner: string, id: string, signal?: AbortSignal) {
+    return this.serial(id, async () => {
+      const session = await this.get(owner, id);
+      const result = snapshotSchema.parse(
+        await (await this.request(`/sessions/${id}/snapshot`, undefined, signal)).json(),
+      );
+      await this.save(
+        owner,
+        {
+          ...session,
+          url: result.url,
+          title: result.title,
+          status: "active",
+          updatedAt: new Date().toISOString(),
+        },
+        id,
+      );
+      return result;
+    });
+  }
+  /**
+   * Runs a web search through the worker's browser. It borrows the session only to reach
+   * the search page, so it is serialised like every other operation on that session; the
+   * agent then opens any result it wants with read_web.
+   */
+  async search(owner: string, id: string, query: string, signal?: AbortSignal) {
+    await this.get(owner, id);
+    return this.serial(id, async () => {
+      signal?.throwIfAborted();
+      return searchSchema.parse(
+        await (await this.request("/search", { id, query }, signal)).json(),
+      );
+    });
+  }
   async observe(owner: string, url: string, existingId?: string) {
     const id = existingId ?? (await this.create(owner, url)).id;
     return this.serial(id, async () => {
@@ -232,7 +307,7 @@ export class BrowserService {
     // Validated here so a bad payload never costs a worker round trip. The worker would
     // answer the same request with this message; keeping the wording identical means the
     // takeover console shows one stable error either way.
-    const parsed = browserInputSchema.safeParse(value);
+    const parsed = browserWireInputSchema.safeParse(value);
     if (!parsed.success) throw new AppError(UNSUPPORTED_INPUT_MESSAGE, 400);
     return this.serial(id, async () => {
       await this.get(owner, id);
@@ -247,6 +322,47 @@ export class BrowserService {
       // without racing another operation on the same session.
       const page = options.read ? await this.readOwned(owner, id, options.signal) : undefined;
       return { session, page };
+    });
+  }
+  /**
+   * Opens, switches, closes or lists the session's tabs. Serialised like every other
+   * operation on that session, so a tab switch cannot interleave with an action that was
+   * aimed at the tab the agent was on a moment ago.
+   */
+  async tabs(
+    owner: string,
+    id: string,
+    action: "list" | "open" | "switch" | "close",
+    options: { index?: number; url?: string; signal?: AbortSignal } = {},
+  ) {
+    await this.get(owner, id);
+    return this.serial(id, async () => {
+      options.signal?.throwIfAborted();
+      const result = tabsSchema.parse(
+        await (
+          await this.request(
+            "/tabs",
+            {
+              id,
+              action,
+              index: options.index,
+              url: options.url,
+            },
+            options.signal,
+          )
+        ).json(),
+      );
+      // The active tab is what a later action lands on, so the session follows it.
+      const active = result.tabs[result.active];
+      if (active) {
+        const stored = await this.get(owner, id);
+        await this.save(
+          owner,
+          { ...stored, url: active.url, title: active.title, status: "active" },
+          id,
+        );
+      }
+      return result;
     });
   }
   async imports(owner: string, id: string) {

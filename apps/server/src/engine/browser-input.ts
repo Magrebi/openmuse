@@ -1,4 +1,7 @@
 import { z } from "zod";
+// The ref grammar and query bound are defined beside the code that stamps refs onto the
+// page, so the two can never disagree about what a valid element reference looks like.
+import { MAX_QUERY, REF_PATTERN } from "../../../worker/src/extract.ts";
 
 /**
  * Agent-operated browser input. Every bound here mirrors the worker so the model is
@@ -11,6 +14,26 @@ export const SCREEN_WIDTH = 1280;
 export const SCREEN_HEIGHT = 800;
 export const MAX_INPUT_TEXT = 10_000;
 export const MAX_SCROLL = 5000;
+/** Keep in sync with the worker's own ref ceiling. */
+export const MAX_REF_ORDINAL = 999;
+/** Longest plain pause the agent may request. Keep in sync with the worker. */
+export const MAX_DELAY = 10_000;
+/** Most tabs one session may hold open. Keep in sync with the worker. */
+export const MAX_TABS = 8;
+
+/**
+ * A file name the agent may offer for upload. The rule is defined beside the worker's own
+ * check so the two cannot drift: a plain base name only, no separators and no traversal.
+ */
+export const uploadFileNameSchema = z
+  .string()
+  .min(1)
+  .max(180)
+  .regex(
+    /^[\w][\w. -]{0,170}\.[A-Za-z0-9]{1,10}$/,
+    "Use a plain file name such as invoice.pdf, with no path separators.",
+  )
+  .refine((name) => !name.includes(".."), "That file name is not a plain file name.");
 /** Keep in sync with the worker's key whitelist. */
 export const INPUT_KEYS = [
   "Enter",
@@ -57,7 +80,121 @@ export const typeInputSchema = z.object({
   text: z.string().min(1).max(MAX_INPUT_TEXT),
 });
 
-export type BrowserInputKind = "click" | "text" | "key" | "scroll";
+/**
+ * An element ref from the last `browser_snapshot`. Only the shape this worker issues is
+ * accepted, so a model cannot address an element the snapshot never offered.
+ */
+export const refSchema = z
+  .string()
+  .regex(REF_PATTERN, "Use an element ref such as e1 from the latest snapshot.")
+  .refine((ref) => {
+    const ordinal = Number(ref.slice(1));
+    return ordinal >= 1 && ordinal <= MAX_REF_ORDINAL;
+  }, "That element ref is out of range. Read the page again.");
+export const activateInputSchema = z.object({ ref: refSchema });
+export const fillInputSchema = z.object({
+  ref: refSchema,
+  text: z.string().min(1).max(MAX_INPUT_TEXT),
+});
+export const selectInputSchema = z.object({
+  ref: refSchema,
+  value: z.string().min(1).max(MAX_INPUT_TEXT),
+});
+export const checkInputSchema = z.object({ ref: refSchema, checked: z.boolean() });
+export const navInputSchema = z.object({ to: z.enum(["back", "forward", "reload"]) });
+
+/**
+ * A destination the agent may navigate to. `z.url()` accepts `javascript:`, `data:` and
+ * `file:`, none of which is a web page a browser should be asked to open, so the scheme is
+ * checked explicitly wherever a URL reaches the worker.
+ */
+export const WEB_URL_MESSAGE = "Use an http or https address.";
+export function isWebUrl(value: string): boolean {
+  try {
+    const { protocol } = new URL(value);
+    return protocol === "http:" || protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Waiting is the agent's way of letting a page finish arriving. `element` names a ref
+ * from the last snapshot; `delay` is a bounded pause. A wait spends no input budget: it
+ * changes nothing on the page. Each shape is strict so a wait can never smuggle a
+ * parameter its verb does not use — that is what stopped `element` from silently losing
+ * the ref it was waiting on.
+ *
+ * This is the tool-facing shape and carries no `type`; the wire schema adds it.
+ */
+export const waitInputSchema = z.union([
+  z.strictObject({ until: z.literal("idle") }),
+  z.strictObject({ until: z.literal("text") }),
+  z.strictObject({ until: z.literal("element"), ref: refSchema }),
+  z.strictObject({ until: z.literal("delay"), ms: z.number().int().min(0).max(MAX_DELAY) }),
+]);
+export type WaitInput = z.output<typeof waitInputSchema>;
+
+/** A file the session owner already stored, named rather than carried. */
+export const uploadInputSchema = z.object({ ref: refSchema, file: uploadFileNameSchema });
+
+/** Tab management. `open` needs a URL; `switch` and `close` need an index. */
+export const tabsInputSchema = z.union([
+  z.strictObject({ action: z.literal("list") }),
+  z.strictObject({
+    action: z.literal("open"),
+    // `z.url()` alone accepts `javascript:` and `data:`, so the scheme is checked here.
+    // The worker re-validates every destination anyway; this refuses it before the trip.
+    url: z.url().max(2000).refine(isWebUrl, WEB_URL_MESSAGE),
+  }),
+  z.strictObject({
+    action: z.literal("switch"),
+    index: z
+      .number()
+      .int()
+      .min(0)
+      .max(MAX_TABS - 1),
+  }),
+  z.strictObject({
+    action: z.literal("close"),
+    index: z
+      .number()
+      .int()
+      .min(0)
+      .max(MAX_TABS - 1),
+  }),
+]);
+export type TabsInput = z.output<typeof tabsInputSchema>;
+/** A web search query. Bounded like other free text so one call cannot flood a page. */
+export const searchQuerySchema = z.string().trim().min(1).max(MAX_QUERY);
+
+/**
+ * What the `browser_click` tool accepts: either an element ref or a screenshot coordinate.
+ * A union is used rather than one object with optional fields so exactly one addressing
+ * mode has to be supplied — a payload carrying both would be ambiguous about what was
+ * clicked. `strict` matters: with the default stripping, `{ ref, x, y }` would quietly
+ * match the coordinate branch and the ref would never be read.
+ *
+ * This is the tool-facing shape and carries no `type`; the wire schema below adds it.
+ */
+export const clickAnyInputSchema = z.union([
+  z.strictObject({ ref: refSchema }),
+  clickInputSchema.strict(),
+]);
+export type ClickAnyInput = z.output<typeof clickAnyInputSchema>;
+
+export type BrowserInputKind =
+  | "click"
+  | "activate"
+  | "fill"
+  | "select"
+  | "check"
+  | "upload"
+  | "text"
+  | "key"
+  | "scroll"
+  | "nav"
+  | "wait";
 
 /**
  * The worker's `POST /sessions/{id}/input` contract, mirroring its own bounds so a bad
@@ -65,22 +202,42 @@ export type BrowserInputKind = "click" | "text" | "key" | "scroll";
  * remains the final authority.
  */
 export const browserInputSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("activate"), ref: refSchema }),
   z.object({
-    type: z.literal("click"),
-    x: z
-      .number()
-      .min(0)
-      .max(SCREEN_WIDTH - 1),
-    y: z
-      .number()
-      .min(0)
-      .max(SCREEN_HEIGHT - 1),
+    type: z.literal("fill"),
+    ref: refSchema,
+    text: z.string().min(1).max(MAX_INPUT_TEXT),
   }),
+  z.object({
+    type: z.literal("select"),
+    ref: refSchema,
+    value: z.string().min(1).max(MAX_INPUT_TEXT),
+  }),
+  z.object({ type: z.literal("check"), ref: refSchema, checked: z.boolean() }),
+  z.object({ type: z.literal("upload"), ref: refSchema, file: uploadFileNameSchema }),
   z.object({ type: z.literal("text"), text: z.string().min(1).max(MAX_INPUT_TEXT) }),
   z.object({ type: z.literal("key"), key: z.enum(INPUT_KEYS) }),
   z.object({ type: z.literal("scroll"), deltaY: z.number().min(-MAX_SCROLL).max(MAX_SCROLL) }),
+  z.object({ type: z.literal("nav"), to: z.enum(["back", "forward", "reload"]) }),
 ]);
 export type BrowserInputPayload = z.output<typeof browserInputSchema>;
+
+/**
+ * The full wire schema. Clicking and waiting are unions because their shapes genuinely
+ * differ; every other action stays flat. Both union members are strict, so a payload
+ * cannot carry a parameter its verb does not use — which is what stopped `wait` from
+ * silently dropping the ref it was waiting on.
+ */
+export const browserWireInputSchema = z.union([
+  browserInputSchema,
+  // Clicking and waiting are unions here because their tool-facing shapes are unions. The
+  // `type` is added here rather than in the tool schema, so a caller cannot name an action
+  // the tool did not choose.
+  z.strictObject({ type: z.literal("click"), ...clickInputSchema.shape }),
+  z.strictObject({ type: z.literal("click"), ref: refSchema }),
+  ...waitInputSchema.options.map((shape) => shape.extend({ type: z.literal("wait") })),
+]);
+export type BrowserWireInput = z.output<typeof browserWireInputSchema>;
 
 export function originOf(url: string): string | undefined {
   try {
@@ -159,6 +316,22 @@ const CREDENTIAL_TOKENS = new Set([
 export function looksCredentialed(url: string, title: string): boolean {
   if (urlTokens(url).some((token) => CREDENTIAL_TOKENS.has(token))) return true;
   return /sign in|log in|login|create an account|reset password|verification code/i.test(title);
+}
+
+/**
+ * Whether an element the snapshot described is one the agent must not type into. The
+ * worker refuses a password field at the point of action; this is the same rule applied
+ * one layer earlier so the refusal happens before any round trip and reads the same way.
+ */
+export function refusesFill(role: string, name: string, password: boolean): boolean {
+  if (password) return true;
+  if (role !== "textbox") return false;
+  // Matched as whole words over the whole label, so "One-time code" and "2FA PIN" are
+  // caught while "Shipping address" and "Password reset help" are not. The word
+  // boundaries matter: an unbounded `pin` would also match "shipping".
+  return /\bpassword\b|\bpasscode\b|\bpassphrase\b|security code|verification code|one[- ]time|\botp\b|\bpin\b|\bcvv\b|\bcvc\b|security number/i.test(
+    name,
+  );
 }
 // An assignment shape keeps ordinary prose ("the page asks for a password reset") from
 // being read as a secret while still catching a real value being handed over. Words that
