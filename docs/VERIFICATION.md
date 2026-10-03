@@ -1,5 +1,62 @@
 # Release verification
 
+March 10, 2026 · Marathon audit pass over the server engine, worker network
+boundary, integrations and mobile client. This records what was exercised and
+what was verified by reading rather than running; it does not claim new
+end-to-end UI capture.
+
+## Automated checks (this audit)
+
+- **432 tests pass**, no failures, no skips, on Node 24 / pnpm 11.19.0. The
+  suite grew from 416 at the start of this pass.
+- Biome, and the root + mobile + desktop + worker TypeScript checks, are clean.
+- New checks added here:
+  - **Bounded mobile requests.** A server that accepts the TCP connection and
+    never answers must reject with one actionable message. Without the deadline
+    the request stays pending and the polling screens stop refreshing silently;
+    the test was confirmed to hang and fail against that behaviour.
+  - **PDF text extraction (8 checks).** Text is read back out of a PDF this
+    repository generates; page ranges return only the requested pages and never
+    leak a neighbouring page; an out-of-range request throws rather than
+    returning nothing; output is bounded and a cut-off page is marked
+    `[truncated]`; unreadable pages are reported, not returned as empty success;
+    a Type0 page is reported `unextractable` rather than as glyph codes.
+  - **PDF text ownership (3 checks).** An owner's PDF text reads back through the
+    service; another owner is refused with the same 404 as the bytes; an
+    out-of-range page request is a 422.
+  - **SQL-side filtering (1 check).** `listWhere` returns only matching records in
+    the expected order, still honours ownership, and returns an empty array for
+    a value with no matches.
+
+## Verified by inspection, not by execution
+
+These were checked by reading the code and, where possible, by running a probe.
+They are *not* new runtime capture.
+
+- **Egress/SSRF.** 21 hostile encodings were run against the live validator —
+  canonical `169.254.169.254`, IPv4-mapped IPv6, decimal/hex/octal loopback,
+  short `127.1`, `localhost` and subdomains, `.local`, `metadata.google.internal`,
+  a `nip.io` rebinding alias, RFC1918, credentials-in-URL, port 22, and
+  `file:`/`gopher:` schemes. All were rejected. The proxy dials the already
+  resolved IP, so there is no second lookup to rebind against.
+- **Computer isolation.** `ComputerService.inspect` re-reads the live container
+  on every attach and refuses unless every hardening flag still matches. The
+  existing test mutates six of them and asserts `exec` is never issued. This was
+  read, not re-run: the Docker computer job needs a built image and an engine.
+- **Vault.** AES-256-GCM, fresh nonce, versioned envelope, AAD-bound, strict
+  base64url validation before any cipher use.
+- **Uncertain writes.** Google write timeouts / 5xx / unparseable bodies raise
+  `OutcomeUnknownError`, which records `outcome_unknown` and is never replayed.
+
+## Not run in this pass
+
+`pnpm test:browser` (needs Playwright Chromium), `pnpm test:computer` and
+`pnpm test:docker` (need a Docker engine and built images), and the Expo
+platform exports. The desktop Rust host is covered by the `desktop-build` CI
+job rather than a local run. These are unchanged by this audit.
+
+## Prior release record
+
 September 16, 2026 · Capybara and distinct mobile/web demos, following the agent browser release · local fictional workspace. This records exercised behavior and its limits; it does not establish that every planned capability is complete.
 
 ## Automated checks
