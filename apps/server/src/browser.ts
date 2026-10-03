@@ -5,6 +5,7 @@ import type { Auth } from "./auth.ts";
 import { browserConsole } from "./browser-console.ts";
 import type { Config } from "./config.ts";
 import type { Store } from "./db.ts";
+import { browserInputSchema, UNSUPPORTED_INPUT_MESSAGE } from "./engine/browser-input.ts";
 import { AppError } from "./errors.ts";
 import type { Files } from "./files.ts";
 
@@ -222,14 +223,30 @@ export class BrowserService {
     await this.get(owner, id);
     return this.request(`/sessions/${id}/screenshot`);
   }
-  async input(owner: string, id: string, value: unknown) {
+  async input(
+    owner: string,
+    id: string,
+    value: unknown,
+    options: { signal?: AbortSignal; read?: boolean } = {},
+  ) {
+    // Validated here so a bad payload never costs a worker round trip. The worker would
+    // answer the same request with this message; keeping the wording identical means the
+    // takeover console shows one stable error either way.
+    const parsed = browserInputSchema.safeParse(value);
+    if (!parsed.success) throw new AppError(UNSUPPORTED_INPUT_MESSAGE, 400);
     return this.serial(id, async () => {
       await this.get(owner, id);
-      return this.save(
+      options.signal?.throwIfAborted();
+      const session = await this.save(
         owner,
-        await (await this.request(`/sessions/${id}/input`, value)).json(),
+        await (await this.request(`/sessions/${id}/input`, parsed.data, options.signal)).json(),
         id,
       );
+      // The worker answers an input with refreshed session metadata only. Re-reading
+      // inside the same serialised block gives the caller the grounding read_web returns,
+      // without racing another operation on the same session.
+      const page = options.read ? await this.readOwned(owner, id, options.signal) : undefined;
+      return { session, page };
     });
   }
   async imports(owner: string, id: string) {

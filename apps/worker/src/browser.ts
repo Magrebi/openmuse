@@ -33,6 +33,76 @@ export function validateSessionId(id: unknown): string {
   return id.toLowerCase();
 }
 
+/** Screenshots are 1280x800, and clicks are addressed in that coordinate space. */
+export const SCREEN_WIDTH = 1280;
+export const SCREEN_HEIGHT = 800;
+export const MAX_INPUT_TEXT = 10_000;
+export const MAX_SCROLL = 5000;
+/** The only keys a caller may press. Nothing else reaches the page keyboard. */
+export const INPUT_KEYS = [
+  "Enter",
+  "Tab",
+  "Escape",
+  "Backspace",
+  "Delete",
+  "ArrowUp",
+  "ArrowDown",
+  "ArrowLeft",
+  "ArrowRight",
+  "Home",
+  "End",
+  "PageUp",
+  "PageDown",
+  "Control+a",
+  "Meta+a",
+  "Shift+Tab",
+] as const;
+export type BrowserInput =
+  | { type: "click"; x: number; y: number }
+  | { type: "text"; text: string }
+  | { type: "key"; key: (typeof INPUT_KEYS)[number] }
+  | { type: "scroll"; deltaY: number };
+
+const isInputKey = (value: unknown): value is (typeof INPUT_KEYS)[number] =>
+  typeof value === "string" && (INPUT_KEYS as readonly string[]).includes(value);
+
+/**
+ * Narrows an untrusted request body to exactly one supported action. Kept pure and
+ * exported so the bounds are covered without launching a browser.
+ */
+export function validateInput(input: Record<string, unknown>): BrowserInput {
+  const { type, x, y, key, text, deltaY } = input;
+  const invalid = new WorkerError("INVALID_INPUT", "Unsupported browser input or coordinates.");
+  if (
+    type === "click" &&
+    typeof x === "number" &&
+    typeof y === "number" &&
+    Number.isFinite(x) &&
+    Number.isFinite(y) &&
+    x >= 0 &&
+    x < SCREEN_WIDTH &&
+    y >= 0 &&
+    y < SCREEN_HEIGHT
+  )
+    return { type: "click", x, y };
+  if (
+    type === "text" &&
+    typeof text === "string" &&
+    text.length > 0 &&
+    text.length <= MAX_INPUT_TEXT
+  )
+    return { type: "text", text };
+  if (type === "key" && isInputKey(key)) return { type: "key", key };
+  if (
+    type === "scroll" &&
+    typeof deltaY === "number" &&
+    Number.isFinite(deltaY) &&
+    Math.abs(deltaY) <= MAX_SCROLL
+  )
+    return { type: "scroll", deltaY };
+  throw invalid;
+}
+
 export async function createBrowserManager(options: {
   dataDir: string;
   maxSessions?: number;
@@ -325,37 +395,11 @@ export async function createBrowserManager(options: {
     input: (id: string, input: Record<string, unknown>) =>
       serial(id, async () => {
         const { page } = active(id);
-        const { type, x, y, key, text, deltaY } = input;
-        if (
-          type === "click" &&
-          typeof x === "number" &&
-          typeof y === "number" &&
-          Number.isFinite(x) &&
-          Number.isFinite(y) &&
-          x >= 0 &&
-          x < 1280 &&
-          y >= 0 &&
-          y < 800
-        )
-          await page.mouse.click(x, y);
-        else if (type === "text" && typeof text === "string" && text.length <= 10_000)
-          await page.keyboard.insertText(text);
-        else if (
-          type === "key" &&
-          typeof key === "string" &&
-          /^(Enter|Tab|Escape|Backspace|Delete|ArrowUp|ArrowDown|ArrowLeft|ArrowRight|Home|End|PageUp|PageDown|Control\+a|Meta\+a|Shift\+Tab)$/.test(
-            key,
-          )
-        )
-          await page.keyboard.press(key);
-        else if (
-          type === "scroll" &&
-          typeof deltaY === "number" &&
-          Number.isFinite(deltaY) &&
-          Math.abs(deltaY) <= 5000
-        )
-          await page.mouse.wheel(0, deltaY);
-        else throw new WorkerError("INVALID_INPUT", "Unsupported browser input or coordinates.");
+        const action = validateInput(input);
+        if (action.type === "click") await page.mouse.click(action.x, action.y);
+        else if (action.type === "text") await page.keyboard.insertText(action.text);
+        else if (action.type === "key") await page.keyboard.press(action.key);
+        else await page.mouse.wheel(0, action.deltaY);
         return refresh(id);
       }),
     downloads: async (id: string) => {

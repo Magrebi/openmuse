@@ -12,10 +12,18 @@ export type TaskStatus =
   | "cancelled";
 export interface Evidence {
   id: string;
-  kind: "mail" | "file" | "web" | "user";
+  kind: "mail" | "file" | "web" | "user" | "browser_input";
   title: string;
   excerpt: string;
   url?: string;
+  /** Set on agent-driven browser input receipts; absent for read-only evidence. */
+  action?: string;
+  params?: unknown;
+  urlBefore?: string;
+  urlAfter?: string;
+  at?: string;
+  /** True when the input outcome is unknown, so it must never be replayed. */
+  uncertain?: boolean;
 }
 export interface TaskStep {
   id: string;

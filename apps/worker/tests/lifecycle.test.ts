@@ -7,6 +7,45 @@ import test from "node:test";
 import { chromium } from "playwright";
 import { createBrowserManager } from "../src/browser.ts";
 
+test("every supported input reaches a real page and refreshes the session", {
+  timeout: 90_000,
+}, async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "openmuse-browser-input-"));
+  const browser = await createBrowserManager({ dataDir });
+  const id = randomUUID();
+  try {
+    await browser.create(id, "https://example.com/");
+    const before = await browser.read(id);
+    // Each action returns refreshed session metadata. Together these cover the whole
+    // dispatch, so a refactor of the input handling cannot silently stop one branch.
+    for (const input of [
+      { type: "scroll", deltaY: 500 },
+      { type: "key", key: "Tab" },
+      { type: "text", text: "hello" },
+      // The far corner of example.com is empty, so this must not navigate anywhere.
+      { type: "click", x: 1270, y: 790 },
+    ]) {
+      const session = await browser.input(id, input);
+      assert.equal(session.id, id);
+      assert.equal(session.status, "active");
+    }
+    const after = await browser.read(id);
+    assert.equal(after.url, before.url, "input on an inert corner must not navigate");
+    // Bounds are still enforced by the worker itself, whatever the server sent.
+    for (const input of [
+      { type: "click", x: 1280, y: 0 },
+      { type: "click", x: 0, y: 800 },
+      { type: "text", text: "x".repeat(10_001) },
+      { type: "key", key: "F5" },
+      { type: "scroll", deltaY: 5001 },
+    ])
+      await assert.rejects(browser.input(id, input), { code: "INVALID_INPUT" });
+  } finally {
+    await browser.close();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
 test("real Chromium cleans failed profiles and restores a saved UUID after worker restart", {
   timeout: 90_000,
 }, async () => {

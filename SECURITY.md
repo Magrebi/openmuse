@@ -28,4 +28,10 @@ Docker shares its host kernel and does not provide a full VM or a hostile-tenant
 
 A proposal is bound to the account, reviewed content, and applicable provider version. The server requires a recorded approval before dispatching a send or calendar change. An uncertain network outcome is retained for reconciliation. Cancellation stops later task steps; a provider request already in flight may still finish.
 
+## Agent-driven browser input
+
+A delegated model task may scroll, press keys, click and type on the page it is reading. The server, not the model, enforces these limits: a 25-action budget per task that survives restart; a same-origin scope that freezes input when a page navigates elsewhere until the agent re-observes; and durable `browser_input` receipts recording each action, its parameters, and the URL before and after.
+
+The agent never types credentials. Credential-shaped text is refused before it reaches the page, and any sign-in page is handed back to the user through the takeover console. A page that looks like a purchase, payment or reservation step pauses the task for the user; the agent does not add to a cart, check out, or submit a transaction. The credential heuristics are defence in depth, not a security boundary: the takeover console and the transactional gate are the real controls. An input whose outcome is unknown is recorded as uncertain, never replayed, and pauses further input until the page is read again. Page text is untrusted data and cannot grant a permission or approve an action.
+
 A server-only CopilotKit Intelligence project key is needed for the sample walkthrough. CI uses synthetic keys and mocked Intelligence boundaries. No provider keys, personal data, or third-party logins are needed for CI. CopilotKit Intelligence and any configured model/provider operate under their own terms and data policies. Optional live Jev (`JEV_MODE=live`) sends the user's latest message, agent-written context, and candidate choices to TypeSafe; see [what live mode sends](docs/demos/jev-generative-ui.md#what-live-mode-sends-to-typesafe).

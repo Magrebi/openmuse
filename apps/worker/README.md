@@ -81,6 +81,8 @@ node --experimental-strip-types --test apps/worker/tests/lifecycle.test.ts
 
 The Docker test checks authentication, public page navigation, PNG dimensions, console input, redirect blocking, a real PDF download, worker restart, and profile/localStorage persistence. Public fixtures require internet access. The test's separate Chromium process seeds localStorage in its own disposable profile; the production API exposes no JavaScript evaluation endpoint.
 
+The lifecycle test drives every supported input against a real page and checks that an inert click does not navigate, and that the same bounds and key whitelist reject bad payloads. The worker's input validation is also covered without a browser by `tests/browser-worker-input.test.ts` in the root suite, which also asserts the API rejects with this worker's own wording.
+
 ## Local development
 
 From the repository root, configure `.env` with matching `WORKER_TOKEN` and `BROWSER_WORKER_URL`, then run:

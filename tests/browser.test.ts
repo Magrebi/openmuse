@@ -107,8 +107,118 @@ test("console input persists the worker's current page title and URL", async (t)
   const { db, service } = await browserFixture(t, () => ({ data: updated }));
   await db.put("owner", "browsers", savedSession);
   const result = await service.input("owner", sessionId, { type: "key", key: "Enter" });
-  assert.equal(result.title, updated.title);
+  assert.equal(result.session.title, updated.title);
   assert.deepEqual(await service.get("owner", sessionId), updated);
+});
+
+test("input refuses out-of-range payloads and unowned sessions before the worker is called", async (t) => {
+  const paths: string[] = [];
+  const { db, service } = await browserFixture(t, (path) => {
+    paths.push(path);
+    return { data: { ...savedSession, title: "New page" } };
+  });
+  await db.put("owner", "browsers", savedSession);
+  await assert.rejects(service.input("stranger", sessionId, { type: "scroll", deltaY: 10 }), {
+    status: 404,
+  });
+  assert.deepEqual(paths, [], "an unowned session never reaches the worker");
+  for (const value of [
+    { type: "click", x: 1280, y: 10 },
+    { type: "click", x: 10, y: 800 },
+    { type: "click", x: -1, y: 10 },
+    { type: "text", text: "x".repeat(10_001) },
+    { type: "key", key: "F5" },
+    { type: "scroll", deltaY: 5001 },
+    { type: "scroll", deltaY: -5001 },
+    { type: "unknown" },
+  ])
+    await assert.rejects(service.input("owner", sessionId, value), {
+      status: 400,
+      // The takeover console shows this text verbatim, so it must stay readable.
+      message: "Unsupported browser input or coordinates.",
+    });
+  assert.deepEqual(paths, [], "out-of-range payloads never reach the worker");
+  const ok = await service.input("owner", sessionId, { type: "scroll", deltaY: -600 });
+  assert.deepEqual(paths, [`/sessions/${sessionId}/input`]);
+  assert.equal(ok.page, undefined, "the page is only re-read when the caller asks for it");
+});
+
+test("the console endpoint reports a rejected input in the worker's own wording", async (t) => {
+  const { db, config } = await browserFixture(t, () => ({
+    data: { ...savedSession, title: "New page" },
+  }));
+  const { app, auth, agent } = await createApp(db, config);
+  t.after(() => agent.stop());
+  const { token } = await auth.session();
+  const headers = { Authorization: `Bearer ${token}`, "Content-Type": "application/json" };
+  await db.put("local-user", "browsers", savedSession);
+  const rejected = await app.request(`/api/browsers/${sessionId}/console`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ type: "click", x: 5000, y: 10 }),
+  });
+  assert.equal(rejected.status, 400);
+  assert.deepEqual(await rejected.json(), {
+    error: "Unsupported browser input or coordinates.",
+  });
+});
+
+test("input maps a worker rejection to an AppError and does not retry it", async (t) => {
+  let calls = 0;
+  const { db, service } = await browserFixture(t, () => {
+    calls++;
+    return {
+      status: 400,
+      data: {
+        error: { code: "INVALID_INPUT", message: "Unsupported browser input or coordinates." },
+      },
+    };
+  });
+  await db.put("owner", "browsers", savedSession);
+  await assert.rejects(service.input("owner", sessionId, { type: "click", x: 5, y: 5 }), {
+    message: "Unsupported browser input or coordinates.",
+  });
+  assert.equal(calls, 1, "a rejected input is never replayed");
+});
+
+test("input serialises per session so concurrent actions cannot interleave", async (t) => {
+  let active = 0;
+  let peak = 0;
+  const { db, service } = await browserFixture(t, async () => {
+    active++;
+    peak = Math.max(peak, active);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    active--;
+    return { data: { ...savedSession, title: "New page" } };
+  });
+  await db.put("owner", "browsers", savedSession);
+  await Promise.all([
+    service.input("owner", sessionId, { type: "scroll", deltaY: 100 }),
+    service.input("owner", sessionId, { type: "key", key: "Tab" }),
+    service.input("owner", sessionId, { type: "scroll", deltaY: 200 }),
+  ]);
+  assert.equal(peak, 1, "one session runs one operation at a time");
+});
+
+test("input can re-read the page in the same serialised block", async (t) => {
+  const paths: string[] = [];
+  const { db, service } = await browserFixture(t, (path) => {
+    paths.push(path);
+    return path.endsWith("/read")
+      ? {
+          data: { url: "https://example.org/", title: "Read", text: "Body text", truncated: false },
+        }
+      : { data: { ...savedSession, url: "https://example.org/", title: "Read" } };
+  });
+  await db.put("owner", "browsers", savedSession);
+  const result = await service.input(
+    "owner",
+    sessionId,
+    { type: "click", x: 5, y: 5 },
+    { read: true },
+  );
+  assert.deepEqual(paths, [`/sessions/${sessionId}/input`, `/sessions/${sessionId}/read`]);
+  assert.equal(result.page?.text, "Body text");
 });
 
 test("failed creation remains app-visible and can be retried with its original UUID", async (t) => {
