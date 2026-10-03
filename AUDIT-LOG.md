@@ -29,6 +29,21 @@ Not run at baseline (need Docker/network/external services): `pnpm test:browser`
 (Playwright Chromium), `pnpm test:computer`, `pnpm build:web|ios|android`,
 `cargo test` for the desktop host (covered by the desktop-build CI job).
 
+## Cycle template used throughout
+
+```md
+## Cycle N — <subsystem> — <UTC timestamp>
+Elapsed so far: Xh Ym
+Pass 1: <map notes / verified unchanged>
+Pass 2: <bugs found/fixed, with severity>
+Pass 3: <security findings>
+Pass 4: <robustness/perf findings>
+Pass 5: <capabilities added>
+Commits: <hashes>
+Blocked: <items or "none">
+Next: <subsystem>
+```
+
 ## Cycle 1 — apps/server/src/ + apps/worker/src/network.ts + apps/mobile/src/ — 2026-10-03T19:05Z
 Elapsed so far: ~1h 20m (start 17:47Z; date +%s 1791049645)
 
@@ -184,17 +199,71 @@ Commits: 7f565a2
 Blocked: none
 Next: final verification cycle
 
-## Cycle template
+## Final summary
 
-```
-## Cycle N — <subsystem> — <UTC timestamp>
-Elapsed so far: Xh Ym
-Pass 1: <map notes / verified unchanged>
-Pass 2: <bugs found/fixed, with severity>
-Pass 3: <security findings>
-Pass 4: <robustness/perf findings>
-Pass 5: <capabilities added>
-Commits: <hashes>
-Blocked: <items or "none">
-Next: <subsystem>
-```
+**Elapsed.** Work spans roughly 17:47Z → 20:25Z (epoch 1791049645 → ~1791056750),
+about 2h 40m of active work. This is **short of the 8-hour minimum** in §8. I
+stopped because the session's remaining budget could not support eight hours of
+honest, verified work, and the stop conditions in §8 are explicitly conjunctive
+("elapsed ≥ 8h **AND** final cycle clean **AND** two consecutive clean cycles").
+Rather than pad the log, the shortfall is recorded here plainly. The cycles below
+cover all 7 subsystems; the clean cycles are Cycles 1–3 for the subsystems that
+had no findings.
+
+### Bugs fixed, by severity
+
+| Severity | Finding | Commit |
+| --- | --- | --- |
+| medium | Mobile `fetch` had no timeout; a wedged API left every polling screen permanently frozen showing stale data with no error. | 452f71b |
+| medium | Task detail and mail-thread reads scanned the owner's entire history and filtered in JavaScript. | 7f565a2 |
+
+No critical or high-severity defects were found. Two subsystems were audited in
+depth and found sound rather than assumed sound (SSRF egress, computer sandbox
+isolation); both are documented above with the specific property that was
+checked, so a later reader can disagree with the conclusion rather than take it
+on trust.
+
+### Capabilities added
+
+- **`read_pdf`** (cb2a418) — the agent can now read the text of a PDF the owner
+  already imported, one page range at a time. Before this, `inspect_pdf` exposed
+  only a page count and form fields, so "summarise this 200-page PDF" was not
+  answerable at all. Undecodable pages are reported rather than returned as
+  mojibake.
+
+### Things I deliberately did not do
+
+- **Did not expand `infra/compose.yaml`.** Container "mode" in the desktop app
+  still only has `browser-worker`; adding api/web services would change the
+  repo's documented deployment topology and is a product decision, not an audit
+  finding. Left as-is and flagged in the Cycle 1 summary of the prior session.
+- **Did not start Phase 3 of the desktop work** (QR pairing, approval
+  notifications). The desktop prompt scopes those as post-merge stretch.
+
+### Blocked — needs a human
+
+| Item | What is needed |
+| --- | --- |
+| Live Google acceptance (Gmail/Calendar/Profile) | A real Google account and OAuth client. `docs/VERIFICATION.md` already records this as outstanding. |
+| Live model acceptance for open-ended jobs | A provider API key. The model path is covered by fixture tests only. |
+| Chromium browser suite (`pnpm test:browser`) | Playwright Chromium install; not run in this pass. |
+| Docker computer smoke test (`pnpm test:computer`) | A running Docker engine plus the built `openmuse-computer:local` image. Not run in this pass. |
+| Desktop Tauri *installer* bundle | Linux system libraries (`libwebkit2gtk-4.1-dev` etc.). The crate compiles and its tests pass; the bundling step runs in the `desktop-build` CI job. |
+
+### Suggested next marathon focus
+
+1. **`workspace.ts` still has four full-collection reads** (`listCalEvents`,
+   `searchMail`, `eventsForRange`, and the snapshot). Only `thread()` was
+   converted this pass; `searchMail` in particular scans every message body in
+   JavaScript and would benefit from a SQL-side filter.
+2. **Add a `listWhere` covering-index path.** The new query uses
+   `data->>'taskId'`, which has no index. A functional index on
+   `(owner, kind, (data->>'taskId'))` would make the task-detail read cheap at
+   scale; that needs a migration and is a schema change.
+3. **Chromium-level tests for the new `read_pdf` path against a real-world PDF**
+   with embedded subset fonts, to measure how often the `unextractable`
+   degradation actually fires in practice.
+4. **`ROADMAP.md` product extensions remain largely unticked** — recurring
+   calendar editing and Drive/Docs remain the cheapest next capabilities after
+   `read_pdf`.
+
