@@ -507,6 +507,9 @@ export class WorkspaceService {
     // A poll failure must never turn an applied action into a "failed" one.
     await new Promise((resolve) => setTimeout(resolve, 3000));
     const verb = action === "restart" ? "Restart" : action === "start" ? "Start" : "Stop";
+    // L3: the end state each action asks for. CasaOS applies changes
+    // asynchronously, so this is what the poll is actually waiting for.
+    const wanted = action === "stop" ? "exited" : "running";
     try {
       let status = "unknown";
       for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -514,9 +517,19 @@ export class WorkspaceService {
         const entry = (await client.listApps(true)).find((candidate) => candidate.name === app);
         if (!entry) break;
         status = entry.status;
+        // Stop as soon as the requested state is observed. Without this the
+        // loop always burned its full ~7s even when the first poll already
+        // showed the app had settled.
+        if (status === wanted) break;
         if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 3500));
       }
-      return `${verb} of "${app}" was requested on CasaOS. Current status: ${status}. CasaOS applies this change asynchronously.`;
+      // Say so plainly when the observed state contradicts what was asked for,
+      // instead of reporting a "running" app after the user approved a stop.
+      const mismatch =
+        status === wanted
+          ? ""
+          : ` (expected "${wanted}" after this change; the app may not have applied it — check it on CasaOS before retrying)`;
+      return `${verb} of "${app}" was requested on CasaOS. Current status: ${status}${mismatch}. CasaOS applies this change asynchronously.`;
     } catch {
       return `${verb} of "${app}" was requested on CasaOS. Current status could not be read.`;
     }
