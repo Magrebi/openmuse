@@ -322,22 +322,25 @@ export class Store {
     const bounded = Number.isFinite(keep)
       ? Math.max(1, Math.min(10_000, Math.floor(keep)))
       : 10_000;
-    // Counted with a separate statement rather than from the DELETE's own
-    // rowCount: PGlite does not populate it, so returning it would report zero
-    // deletions on the very database OpenMuse runs on.
-    const before = await this.db.query(
-      "SELECT count(*)::int AS total FROM records WHERE owner=$1 AND kind=$2",
-      [owner, kind],
-    );
-    const total = Number(before.rows[0]?.total ?? 0);
-    if (total <= bounded) return 0;
-    await this.db.query(
-      `DELETE FROM records WHERE owner=$1 AND kind=$2 AND id NOT IN (
-         SELECT id FROM records WHERE owner=$1 AND kind=$2 ORDER BY updated_at DESC,id LIMIT $3
-       )`,
+    // One statement, so the returned count is by construction the number of rows
+    // deleted — counting first and deleting second let a concurrent insert land
+    // between them and report a count that was never true. The `DELETE`'s own
+    // rowCount is not an option: the `pg` driver populates it, but PGlite does
+    // not, and PGlite is the database OpenMuse runs on by default.
+    //
+    // The `NOT IN` subquery is correct because `id` is unique within
+    // (owner, kind) — it is half of the table's primary key — so the newest
+    // `bounded` rows are exactly the ones whose ids the subquery returns.
+    const result = await this.db.query(
+      `DELETE FROM records
+       WHERE owner=$1 AND kind=$2
+         AND id NOT IN (
+           SELECT id FROM records WHERE owner=$1 AND kind=$2 ORDER BY updated_at DESC,id LIMIT $3
+         )
+       RETURNING id`,
       [owner, kind, bounded],
     );
-    return total - bounded;
+    return result.rows.length;
   }
   async recoverInterruptedActions(): Promise<void> {
     await this.db.query(
