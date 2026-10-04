@@ -298,11 +298,14 @@ export async function createApp(
     password: z.string().min(1).max(1024),
   });
   // Brute-force protection: 5 saves per minute per owner.
+  // L5: the window is deleted when it lapses, not just reset, so the map does
+  // not retain one entry per owner that has ever signed in.
   const casaOSSaveWindow = new Map<string, { window: number; attempts: number }>();
   function checkCasaOSSaveLimit(owner: string) {
     const now = Date.now();
     const entry = casaOSSaveWindow.get(owner);
     if (!entry || now - entry.window > 60_000) {
+      casaOSSaveWindow.delete(owner);
       casaOSSaveWindow.set(owner, { window: now, attempts: 1 });
       return;
     }
