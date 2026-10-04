@@ -329,3 +329,231 @@ test("idle Postgres client errors are logged instead of crashing the process", a
     await pool.end();
   }
 });
+
+// ---------------------------------------------------------------------------
+// Index registration, verified against the catalog rather than EXPLAIN.
+// ---------------------------------------------------------------------------
+
+test("the worker tick's scan index is registered and startup DDL is idempotent", async () => {
+  // scan() filters on `kind` alone and runs on the 1s worker tick, so the index
+  // is asserted against pg_indexes. EXPLAIN is deliberately not used: on a
+  // fixture-sized table the planner may legitimately prefer a sequential scan,
+  // which would make the assertion depend on statistics rather than on schema.
+  const root = await mkdtemp(join(tmpdir(), "openmuse-db-index-"));
+  try {
+    const db = await createStore({ dataDir: join(root, "pg") });
+    const indexes = await db.indexNames();
+    assert.ok(
+      indexes.includes("records_kind_updated"),
+      `expected records_kind_updated among ${JSON.stringify(indexes)}`,
+    );
+    assert.ok(indexes.includes("records_task_id"), "the taskId index is registered");
+    // Re-running the DDL on an existing data directory must not fail or duplicate.
+    const reopened = await createStore({ dataDir: join(root, "pg") });
+    assert.deepEqual((await reopened.indexNames()).sort(), indexes.sort());
+    await reopened.close();
+    await db.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Calendar range filtering, pushed into SQL.
+// ---------------------------------------------------------------------------
+
+test("listEventsInRange returns only events overlapping the window, in start order", async () => {
+  const root = await mkdtemp(join(tmpdir(), "openmuse-db-events-"));
+  try {
+    const db = await createStore({ dataDir: join(root, "pg") });
+    const event = (id: string, start: string, end: string, calendarId = "primary") =>
+      db.put("owner", "events", { id, calendarId, start, end, title: id });
+    // Inserted deliberately out of order so the ORDER BY is doing real work.
+    await event("late", "2026-03-10T10:00:00.000Z", "2026-03-10T11:00:00.000Z");
+    await event("early", "2026-03-01T09:00:00.000Z", "2026-03-01T10:00:00.000Z");
+    await event("boundary", "2026-03-05T00:00:00.000Z", "2026-03-05T01:00:00.000Z");
+    // A different calendar must never leak into the primary calendar's read.
+    await event("other-cal", "2026-03-01T09:00:00.000Z", "2026-03-01T10:00:00.000Z", "work");
+
+    const inMarch = await db.listEventsInRange<{ id: string }>(
+      "owner",
+      "events",
+      "calendarId",
+      "primary",
+      { from: "2026-03-01T00:00:00.000Z", to: "2026-04-01T00:00:00.000Z" },
+    );
+    assert.deepEqual(
+      inMarch.map((e) => e.id),
+      ["early", "boundary", "late"],
+      "sorted by start, and only the requested calendar",
+    );
+
+    // A window that overlaps only the middle event.
+    const middle = await db.listEventsInRange<{ id: string }>(
+      "owner",
+      "events",
+      "calendarId",
+      "primary",
+      { from: "2026-03-05T00:30:00.000Z", to: "2026-03-05T00:45:00.000Z" },
+    );
+    assert.deepEqual(
+      middle.map((e) => e.id),
+      ["boundary"],
+      "partial overlap still counts",
+    );
+
+    // An empty window returns nothing rather than everything.
+
+    test("listEventsInRange compares instants, not wall-clock strings, across offsets", async () => {
+      // 2026-03-08 is the US DST transition: 02:30 local does not exist that day, so
+      // a wall-clock string comparison and an instant comparison disagree here.
+      const root = await mkdtemp(join(tmpdir(), "openmuse-db-events-tz-"));
+      try {
+        const db = await createStore({ dataDir: join(root, "pg") });
+        // Stored with a -05:00 offset, so this event starts at 07:30Z.
+        await db.put("owner", "events", {
+          id: "dst",
+          calendarId: "primary",
+          start: "2026-03-08T02:30:00-05:00",
+          end: "2026-03-08T04:30:00-04:00",
+        });
+        // Same wall-clock digits, different instant (+01:00), a day earlier: 01:30Z
+        // on 03-07.
+        await db.put("owner", "events", {
+          id: "offset",
+          calendarId: "primary",
+          start: "2026-03-07T02:30:00+01:00",
+          end: "2026-03-07T04:30:00+01:00",
+        });
+
+        // A window covering 03-08 in UTC must select only the DST event.
+        const day = await db.listEventsInRange<{ id: string }>(
+          "owner",
+          "events",
+          "calendarId",
+          "primary",
+          { from: "2026-03-08T00:00:00Z", to: "2026-03-09T00:00:00Z" },
+        );
+        assert.deepEqual(
+          day.map((e) => e.id),
+          ["dst"],
+          "the offset event is a different instant",
+        );
+
+        // Ordering is by instant: offset (01:30Z on 03-07) precedes dst (07:30Z on 03-08).
+        const both = await db.listEventsInRange<{ id: string }>(
+          "owner",
+          "events",
+          "calendarId",
+          "primary",
+        );
+        assert.deepEqual(
+          both.map((e) => e.id),
+          ["offset", "dst"],
+        );
+        await db.close();
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+
+    test("listEventsInRange skips a malformed timestamp instead of aborting the read", async () => {
+      // The cast is the hazard: without the ISO shape test before it, one bad row
+      // raises and takes every other event in the calendar down with it — the same
+      // failure mode the claim path guards against.
+      const root = await mkdtemp(join(tmpdir(), "openmuse-db-events-bad-"));
+      try {
+        const db = await createStore({ dataDir: join(root, "pg") });
+        await db.put("owner", "events", {
+          id: "good",
+          calendarId: "primary",
+          start: "2026-03-01T09:00:00.000Z",
+          end: "2026-03-01T10:00:00.000Z",
+        });
+        await db.put("owner", "events", {
+          id: "bad-start",
+          calendarId: "primary",
+          start: "not-a-date",
+          end: "2026-03-01T10:00:00.000Z",
+        });
+        await db.put("owner", "events", {
+          id: "bad-end",
+          calendarId: "primary",
+          start: "2026-03-01T09:00:00.000Z",
+          end: { nested: true },
+        });
+
+        const found = await db.listEventsInRange<{ id: string }>(
+          "owner",
+          "events",
+          "calendarId",
+          "primary",
+          { from: "2026-03-01T00:00:00Z", to: "2026-04-01T00:00:00Z" },
+        );
+        assert.deepEqual(
+          found.map((e) => e.id),
+          ["good"],
+          "the good event survives the bad rows",
+        );
+        // The bad rows are not deleted; they are merely not matched.
+        assert.ok(await db.get("owner", "events", "bad-start"), "no data is destroyed");
+        await db.close();
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+
+    test("listEventsInRange rejects an unparseable window rather than silently matching nothing", async () => {
+      const root = await mkdtemp(join(tmpdir(), "openmuse-db-events-badwin-"));
+      try {
+        const db = await createStore({ dataDir: join(root, "pg") });
+        await db.put("owner", "events", {
+          id: "e1",
+          calendarId: "primary",
+          start: "2026-03-01T09:00:00.000Z",
+          end: "2026-03-01T10:00:00.000Z",
+        });
+        // An unparseable bound would make every comparison false, returning an empty
+        // calendar that reads as "no events" rather than as a caller mistake.
+        await assert.rejects(
+          db.listEventsInRange("owner", "events", "calendarId", "primary", { from: "yesterday" }),
+          /ISO-8601/,
+        );
+        await assert.rejects(
+          db.listEventsInRange("owner", "events", "calendarId", "primary", { to: "2026-13-45" }),
+          /ISO-8601/,
+        );
+        // Omitted bounds stay legal.
+        await db.listEventsInRange("owner", "events", "calendarId", "primary", {});
+        await db.close();
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+
+    const none = await db.listEventsInRange<{ id: string }>(
+      "owner",
+      "events",
+      "calendarId",
+      "primary",
+      { from: "2026-05-01T00:00:00.000Z", to: "2026-05-02T00:00:00.000Z" },
+    );
+    assert.deepEqual(none, [], "a window past every event returns nothing");
+
+    // Omitting both bounds returns the whole calendar, as the previous
+    // unbounded JavaScript filter did.
+    const all = await db.listEventsInRange<{ id: string }>(
+      "owner",
+      "events",
+      "calendarId",
+      "primary",
+    );
+    assert.deepEqual(
+      all.map((e) => e.id),
+      ["early", "boundary", "late"],
+    );
+    await db.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

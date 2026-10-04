@@ -72,21 +72,16 @@ export class WorkspaceService {
     const connection = await this.connection(owner);
     if (!connection) return [];
     if (this.config.mode === "live") return this.google(owner, connection.id).listEvents(options);
-    // One calendar's events, narrowed in the database; the time window is then
-    // applied to that set rather than to every event the owner has.
-    const scoped = await this.db.listWhere<CalendarEvent>(
+    // Narrowed in SQL: the calendar, the overlap window and the ordering are all
+    // applied by the database, so the read scales with the window rather than with
+    // every event the owner has ever stored for this calendar.
+    return this.db.listEventsInRange<CalendarEvent>(
       owner,
       "events",
       "calendarId",
       options.calendarId ?? "primary",
+      { from: options.timeMin, to: options.timeMax },
     );
-    return scoped
-      .filter(
-        (event) =>
-          (!options.timeMax || Date.parse(event.start) < Date.parse(options.timeMax)) &&
-          (!options.timeMin || Date.parse(event.end) > Date.parse(options.timeMin)),
-      )
-      .sort((a, b) => a.start.localeCompare(b.start));
   }
   private async cacheMail(owner: string, mail: Mail[], connectionId: string) {
     const imports = await this.db.list<{ id: string; artifactId: string; connectionId?: string }>(
