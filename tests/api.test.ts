@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -45,6 +46,52 @@ before(async () => {
 after(async () => {
   await db.close();
   await rm(directory, { recursive: true, force: true });
+});
+
+test("expired sessions are collected instead of accumulating forever", async () => {
+  // Nothing in the app used to delete a session row, so every sign-in left a
+  // bearer-token digest behind permanently, long past its 24 hour expiry.
+  const digest = (value: string) => createHash("sha256").update(value).digest("hex");
+  const dead = "a-token-that-expired-yesterday";
+  await db.put("system", "sessions", {
+    id: digest(dead),
+    owner: "local-user",
+    expiresAt: Date.now() - 1,
+  });
+
+  const signIn = async () => {
+    const response = await app.request("/api/session", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    assert.equal(response.status, 200);
+    return (await response.json()).token as string;
+  };
+  const fresh = await signIn();
+
+  assert.ok(
+    !(await db.get("system", "sessions", digest(dead))),
+    "signing in collects sessions that already lapsed",
+  );
+  assert.ok(await db.get("system", "sessions", digest(fresh)), "the session just created is kept");
+  assert.equal(
+    (await app.request("/api/workspace", { headers: { Authorization: `Bearer ${fresh}` } })).status,
+    200,
+    "and still authenticates",
+  );
+
+  // Presenting a lapsed token stays a 401, and now also drops the row.
+  await db.put("system", "sessions", {
+    id: digest(dead),
+    owner: "local-user",
+    expiresAt: Date.now() - 1,
+  });
+  assert.equal(
+    (await app.request("/api/workspace", { headers: { Authorization: `Bearer ${dead}` } })).status,
+    401,
+  );
+  assert.ok(!(await db.get("system", "sessions", digest(dead))), "a rejected token leaves no row");
 });
 
 test("API protects private data and rejects unrelated web origins", async () => {

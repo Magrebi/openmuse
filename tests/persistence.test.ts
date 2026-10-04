@@ -192,6 +192,133 @@ test("searchText matches the rule the in-memory filter used, and honours orderin
   }
 });
 
+test("searchText treats a word's own wildcards as ordinary characters", async () => {
+  // Regression guard for a trap in moving the search into SQL: the words are
+  // concatenated into a LIKE pattern, so an unescaped `%`, `_` or `\` becomes a
+  // wildcard. Searching "100%" then returned every body starting with "100", and
+  // because a backslash is itself the LIKE escape, searching "a\zb" dropped the
+  // row that really contained it and returned an unrelated one instead.
+  const root = await mkdtemp(join(tmpdir(), "openmuse-db-wildcard-"));
+  try {
+    const db = await createStore({ dataDir: join(root, "pg") });
+    const mail = [
+      { id: "pct", body: "Total is 100% due" },
+      { id: "digits", body: "Pay 1001 now" },
+      { id: "plain", body: "Pay 100 now" },
+      { id: "abc", body: "abc" },
+      { id: "spaced", body: "a c" },
+      { id: "literal-underscore", body: "field a_c name" },
+      { id: "literal-backslash", body: "path a\\zb" },
+      { id: "swallowed", body: "azb" },
+    ];
+    for (const message of mail)
+      await db.put("owner", "mail", { ...message, subject: "s", date: "2026-01-01T00:00:00.000Z" });
+
+    const ids = async (...words: string[]) =>
+      (await db.searchText<{ id: string }>("owner", "mail", ["subject", "body"], words)).map(
+        (row) => row.id,
+      );
+
+    assert.deepEqual(await ids("100%"), ["pct"], "only the row holding a literal 100%");
+    assert.deepEqual(await ids("100"), ["digits", "pct", "plain"], "no escaping, no wildcarding");
+    assert.deepEqual(
+      await ids("a_c"),
+      ["literal-underscore"],
+      "_ matches an underscore, not any char",
+    );
+    assert.deepEqual(
+      await ids("a\\zb"),
+      ["literal-backslash"],
+      "the row containing the backslash must be found, not swallowed as an escape",
+    );
+    assert.deepEqual(await ids("%"), ["pct"], "a lone % is not a match-everything wildcard");
+
+    // Ordinary searches, case folding and the all-words rule are unaffected.
+    assert.deepEqual(await ids("abc"), ["abc"]);
+    assert.deepEqual(await ids("A_C"), ["literal-underscore"]);
+    assert.deepEqual(await ids("field", "name"), ["literal-underscore"]);
+    await db.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("claim never lets an unusable expiresAt through or abort the statement", async () => {
+  const root = await mkdtemp(join(tmpdir(), "openmuse-db-claim-"));
+  try {
+    const db = await createStore({ dataDir: join(root, "pg") });
+    const now = new Date().toISOString();
+    const future = new Date(Date.now() + 600_000).toISOString();
+    const past = new Date(Date.now() - 600_000).toISOString();
+    await db.put("owner", "actions", { id: "live", status: "awaiting_review", expiresAt: future });
+    await db.put("owner", "actions", { id: "missing", status: "awaiting_review" });
+    await db.put("owner", "actions", {
+      id: "garbage",
+      status: "awaiting_review",
+      expiresAt: "not-a-date",
+    });
+    await db.put("owner", "actions", { id: "stale", status: "awaiting_review", expiresAt: past });
+
+    // A well-formed, unexpired action still claims exactly as before.
+    const live = await db.claim<{ status: string }>("owner", "live", "executing", now);
+    assert.equal(live?.status, "executing");
+
+    // An unusable expiry must not claim, and must not abort the statement for
+    // every other row: the cast used to raise and surface as an opaque 502.
+    assert.equal(await db.claim("owner", "missing", "executing", now), null);
+    assert.equal(await db.claim("owner", "garbage", "executing", now), null);
+    assert.equal(
+      await db.claim("owner", "stale", "executing", now),
+      null,
+      "expired rows never claim",
+    );
+
+    for (const id of ["missing", "garbage", "stale"])
+      assert.equal(
+        (await db.get<{ status: string }>("owner", "actions", id))?.status,
+        "awaiting_review",
+      );
+    await db.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("pruneExpired clears lapsed rows and leaves everything else alone", async () => {
+  const root = await mkdtemp(join(tmpdir(), "openmuse-db-prune-"));
+  try {
+    const db = await createStore({ dataDir: join(root, "pg") });
+    const now = Date.now();
+    await db.put("system", "sessions", { id: "lapsed", expiresAt: now - 1 });
+    await db.put("system", "sessions", { id: "boundary", expiresAt: now });
+    await db.put("system", "sessions", { id: "valid", expiresAt: now + 60_000 });
+    await db.put("system", "sessions", { id: "undated" });
+    await db.put("system", "sessions", { id: "odd", expiresAt: "not-a-number" });
+    // Neighbours that share the word but not the owner+kind pair being pruned.
+    await db.put("system", "oauth", { id: "elsewhere", expiresAt: now - 1 });
+    await db.put("another-owner", "sessions", { id: "not-ours", expiresAt: now - 1 });
+
+    await db.pruneExpired("system", "sessions", now);
+
+    const left = (await db.list<{ id: string }>("system", "sessions")).map((row) => row.id).sort();
+    assert.deepEqual(left, ["odd", "undated", "valid"], "only lapsed rows are removed");
+    assert.ok(!(await db.get("system", "sessions", "lapsed")));
+    assert.equal(
+      (await db.get("system", "oauth", "elsewhere"))?.id,
+      "elsewhere",
+      "kind is respected",
+    );
+    assert.equal(
+      (await db.get("another-owner", "sessions", "not-ours"))?.id,
+      "not-ours",
+      "another owner is never touched",
+    );
+    await db.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("idle Postgres client errors are logged instead of crashing the process", async (t) => {
   const logged = t.mock.method(console, "error", () => {});
   const pool = createPool("postgres://127.0.0.1:1/openmuse");
