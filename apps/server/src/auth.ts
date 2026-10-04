@@ -4,6 +4,7 @@ import { join } from "node:path";
 import type { Config } from "./config.ts";
 import type { Store } from "./db.ts";
 import { AppError } from "./errors.ts";
+import { backgroundFailure } from "./log.ts";
 
 const digest = (value: string) => createHash("sha256").update(value).digest();
 export class Auth {
@@ -26,18 +27,37 @@ export class Auth {
       owner: "local-user",
       expiresAt: Date.now() + 24 * 60 * 60 * 1000,
     });
+    // Signing in is the one moment sessions are known to be collectable, and it
+    // is rare. Without this the collection only ever grows: nothing in the app
+    // deleted a row, so a bearer-token digest was retained long past the 24 hours
+    // it was good for.
+    await this.pruneSessions();
     return { token, mode: this.config.mode };
   }
   async owner(authorization?: string) {
     if (!authorization?.startsWith("Bearer ")) throw new AppError("Sign in to OpenMuse", 401);
+    const id = digest(authorization.slice(7)).toString("hex");
     const session = await this.db.get<{ owner: string; expiresAt: number }>(
       "system",
       "sessions",
-      digest(authorization.slice(7)).toString("hex"),
+      id,
     );
-    if (!session || session.expiresAt < Date.now())
+    if (!session) throw new AppError("Session expired. Sign in again.", 401);
+    if (session.expiresAt < Date.now()) {
+      // The token is already unusable, so dropping its row changes no decision and
+      // stops the digest outliving the session it stands for.
+      await this.db.remove("system", "sessions", id);
       throw new AppError("Session expired. Sign in again.", 401);
+    }
     return session.owner;
+  }
+  private async pruneSessions() {
+    try {
+      await this.db.pruneExpired("system", "sessions", Date.now());
+    } catch (error) {
+      // A stale row is a cleanup problem, not a reason to refuse a valid sign-in.
+      backgroundFailure("prune expired sessions", error);
+    }
   }
   sign(owner: string, path: string) {
     const expires = String(Date.now() + 15 * 60 * 1000);
