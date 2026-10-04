@@ -48,6 +48,13 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
       - run: pnpm --dir apps/desktop build
+      # Fails fast on a broken crate before the slow release build. The native
+      # host is where a TypeScript-only gate cannot see: `lib.rs` is not part of
+      # `pnpm typecheck`, so a compile error here used to survive until someone
+      # ran `cargo build` locally — which is how a missing `Some(..)` reached
+      # `main` unnoticed.
+      - name: Check the native host compiles
+        run: cargo check --locked --manifest-path apps/desktop/src-tauri/Cargo.toml
       - name: Check the native host formatting
         working-directory: apps/desktop/src-tauri
         run: cargo fmt --check
