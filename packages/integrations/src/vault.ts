@@ -25,11 +25,7 @@ function decodeKey(key: string): Buffer {
 const DEFAULT_AAD = Buffer.from("openmuse:credential:v1");
 
 /** Versioned AES-256-GCM envelope: version.nonce.tag.ciphertext. */
-export function encryptSecret(
-  plaintext: string,
-  key: string,
-  aad: Buffer = DEFAULT_AAD,
-): string {
+export function encryptSecret(plaintext: string, key: string, aad: Buffer = DEFAULT_AAD): string {
   const nonce = randomBytes(12);
   const cipher = createCipheriv("aes-256-gcm", decodeKey(key), nonce);
   cipher.setAAD(aad);
@@ -42,11 +38,7 @@ export function encryptSecret(
   ].join(".");
 }
 
-export function decryptSecret(
-  encrypted: string,
-  key: string,
-  aad: Buffer = DEFAULT_AAD,
-): string {
+export function decryptSecret(encrypted: string, key: string, aad: Buffer = DEFAULT_AAD): string {
   const keyBytes = decodeKey(key);
   const [version, nonceString, tagString, ciphertextString, extra] = encrypted.split(".");
   if (

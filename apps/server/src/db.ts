@@ -287,9 +287,7 @@ export class Store {
     // first because Math.min/max propagate NaN: an unchecked NaN would reach
     // PostgreSQL as the string "NaN" and fail the cast with a driver error,
     // which is a far worse answer than "here are the most recent ones".
-    const capped = Number.isFinite(limit)
-      ? Math.max(1, Math.min(1000, Math.floor(limit)))
-      : 1000;
+    const capped = Number.isFinite(limit) ? Math.max(1, Math.min(1000, Math.floor(limit))) : 1000;
     const result = await this.db.query(
       "SELECT data FROM records WHERE owner=$1 AND kind=$2 ORDER BY updated_at DESC,id LIMIT $3",
       [owner, kind, capped],

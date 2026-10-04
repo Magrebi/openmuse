@@ -622,7 +622,7 @@ test("listRecent survives a limit that is not a number", async () => {
     // row count, so the read still returns everything it should.
     assert.equal((await db.listRecent("owner", "activity", Number.NaN)).length, 5);
     assert.equal((await db.listRecent("owner", "activity", Number.POSITIVE_INFINITY)).length, 5);
-    assert.equal((await db.listRecent("owner", "activity", Number.NEG_INFINITY)).length, 5);
+    assert.equal((await db.listRecent("owner", "activity", Number.NEGATIVE_INFINITY)).length, 5);
     // A finite negative clamps to 1, as before.
     assert.equal((await db.listRecent("owner", "activity", -3)).length, 1);
     // A fractional limit floors rather than failing the cast.
@@ -701,7 +701,7 @@ test("trimOlderThan survives a keep that is not a number", async () => {
     // here, not 1 — failing safe in the direction of keeping rows.)
     assert.equal(await db.trimOlderThan("owner", "run-events", Number.POSITIVE_INFINITY), 0);
     assert.equal((await db.list("owner", "run-events")).length, 6);
-    assert.equal(await db.trimOlderThan("owner", "run-events", Number.NEG_INFINITY), 0);
+    assert.equal(await db.trimOlderThan("owner", "run-events", Number.NEGATIVE_INFINITY), 0);
     assert.equal((await db.list("owner", "run-events")).length, 6);
     // A finite zero clamps to 1: at least one row must survive.
     assert.equal(await db.trimOlderThan("owner", "run-events", 0), 5);
