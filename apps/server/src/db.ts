@@ -283,8 +283,13 @@ export class Store {
     limit: number,
   ): Promise<T[]> {
     // Bounded by the caller but clamped here too, so a bad limit cannot become a
-    // full table scan wearing a different name.
-    const capped = Math.max(1, Math.min(1000, Math.floor(limit)));
+    // full table scan wearing a different name. `Number.isFinite` is checked
+    // first because Math.min/max propagate NaN: an unchecked NaN would reach
+    // PostgreSQL as the string "NaN" and fail the cast with a driver error,
+    // which is a far worse answer than "here are the most recent ones".
+    const capped = Number.isFinite(limit)
+      ? Math.max(1, Math.min(1000, Math.floor(limit)))
+      : 1000;
     const result = await this.db.query(
       "SELECT data FROM records WHERE owner=$1 AND kind=$2 ORDER BY updated_at DESC,id LIMIT $3",
       [owner, kind, capped],
@@ -312,7 +317,11 @@ export class Store {
    * to how long the workspace has been in use.
    */
   async trimOlderThan(owner: string, kind: string, keep: number): Promise<number> {
-    const bounded = Math.max(1, Math.min(10_000, Math.floor(keep)));
+    // `Number.isFinite` first, for the same reason as `listRecent`: Math.min/max
+    // propagate NaN, and a NaN bound reaches PostgreSQL as "NaN" and throws.
+    const bounded = Number.isFinite(keep)
+      ? Math.max(1, Math.min(10_000, Math.floor(keep)))
+      : 10_000;
     // Counted with a separate statement rather than from the DELETE's own
     // rowCount: PGlite does not populate it, so returning it would report zero
     // deletions on the very database OpenMuse runs on.
