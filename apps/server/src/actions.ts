@@ -156,6 +156,12 @@ export class ActionService {
     if (!claimed) {
       const current = await this.db.get<ActionProposal>(owner, "actions", id);
       if (!current) throw new AppError("Action not found", 404);
+      // Losing the claim normally means a concurrent decision already moved this
+      // action on, and `current` is then that newer record. A record still waiting
+      // for review means the claim never matched the stored row at all, and
+      // returning it would report a decision as accepted that never happened.
+      if (current.status === "awaiting_review")
+        throw new AppError("This review could not be claimed. Create a fresh proposal.", 409);
       return current;
     }
     await this.record(
