@@ -14,6 +14,7 @@ import { ActionService } from "./actions.ts";
 import { agentConfigured, makeRuntime } from "./agent.ts";
 import { createAuth } from "./auth.ts";
 import { BrowserService } from "./browser.ts";
+import { searchConversations } from "./chat-search.ts";
 import { ComputerService, type DockerRunner } from "./computer.ts";
 import { computerRoutes } from "./computer-routes.ts";
 import { assertApiDeploymentConfig, type Config } from "./config.ts";
@@ -266,6 +267,11 @@ export async function createApp(
     }
     return c.json({ threadId: main.threadId, existing: true });
   });
+  app.get("/api/chat-search", async (c) =>
+    c.json({
+      hits: await searchConversations(intelligence, c.get("owner"), c.req.query("q") ?? ""),
+    }),
+  );
   app.get("/api/conversation", async (c) =>
     c.json((await db.get(c.get("owner"), "conversations", "default")) ?? { messages: [] }),
   );
