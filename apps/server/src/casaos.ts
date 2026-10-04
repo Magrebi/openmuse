@@ -60,6 +60,12 @@ export interface CasaOSAppLogs {
   lines: string[];
   truncated: boolean;
   redacted: boolean;
+  /**
+   * M3: present instead of `lines` when raw log text is not sent to the model.
+   * `lines` is then empty by construction, so a caller cannot accidentally
+   * forward text it believes it suppressed.
+   */
+  summary?: CasaOSLogShape;
 }
 
 export interface CasaOSSystemStatus {
@@ -263,6 +269,65 @@ export function truncateToTail(
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
 
 /**
+ * M3: a description of log content that carries no log text.
+ *
+ * `redactCasaOSLogs` is explicitly best-effort — it cannot know a bespoke
+ * format, so a secret in an application-specific line survives it. Sending the
+ * surviving text to the model provider would transmit that secret to a third
+ * party and persist it into task state and the transcript. This summary is
+ * derived from the already-redacted text and returns only shape, so it is safe
+ * to send by default.
+ */
+export interface CasaOSLogShape {
+  /** Lines examined, after redaction and tail truncation. */
+  lineCount: number;
+  /** Count of lines per detected severity token (case-insensitive). */
+  levels: Record<string, number>;
+  /** 1-based positions of lines that look like an error or warning. */
+  notableLines: number[];
+  /** True when the log was cut before the end, so the summary is partial. */
+  truncated: boolean;
+}
+
+/**
+ * Summarise redacted log lines by shape instead of returning them.
+ *
+ * Only fixed structural facts are reported: a count, a per-level tally, and line
+ * numbers. No substring of any log line is included, so nothing here can leak
+ * the content it describes.
+ */
+export function summarizeCasaOSLogs(
+  lines: string[],
+  options: { truncated?: boolean } = {},
+): CasaOSLogShape {
+  const levels: Record<string, number> = {};
+  const notableLines: number[] = [];
+  lines.forEach((line, index) => {
+    // Severity words are matched as whole tokens only, and the scan is bounded
+    // per line, so this cannot become a hot spot on a large log.
+    const lowered = line.toLowerCase();
+    for (const [level, pattern] of LOG_LEVEL_PATTERNS)
+      if (pattern.test(lowered)) levels[level] = (levels[level] ?? 0) + 1;
+    if (NOTABLE_LINE.test(lowered)) notableLines.push(index + 1);
+  });
+  return {
+    lineCount: lines.length,
+    levels,
+    notableLines,
+    truncated: options.truncated ?? false,
+  };
+}
+
+const LOG_LEVEL_TOKENS = ["error", "err", "fatal", "panic", "warn", "warning", "critical"];
+const NOTABLE_LINE =
+  /\b(error|err|fatal|panic|warn|warning|critical|traceback|exception|failed|failure)\b/;
+// Precompiled once: the summariser runs over up to 500 lines per request, and
+// building a RegExp per line per token would recompile on every call.
+const LOG_LEVEL_PATTERNS = LOG_LEVEL_TOKENS.map(
+  (level) => [level, new RegExp(`\\b${level}\\b`)] as const,
+);
+
+/**
  * Transport policy for the CasaOS API URL. Only http: and https: are
  * accepted. Plain http: is allowed only for loopback hosts (or with the
  * explicit CASAOS_ALLOW_INSECURE_HTTP=true opt-out, trusted LAN only — the
@@ -426,10 +491,61 @@ function putTransportError(app: string, action: string, error: unknown): Error {
 
 // Per-owner access-token cache. The entry is keyed to a connectionId: any credential
 // save generates a new connectionId, invalidating both this cache and pending reviews.
-const tokenCache = new Map<string, { token: string; connectionId: string }>();
+//
+// L4: entries also carry an expiry so a token is never served past it. CasaOS
+// returns a JWT, whose `exp` claim is read when present; the cache falls back to
+// a conservative TTL when it is not. Refreshing before expiry also avoids a
+// pointless round trip that would otherwise only be discovered by a 401.
+const TOKEN_CACHE_TTL_MS = 10 * 60 * 1000;
+const TOKEN_EXPIRY_MARGIN_MS = 30_000;
+const tokenCache = new Map<string, { token: string; connectionId: string; expiresAt: number }>();
 export function clearCasaOSTokenCache(owner?: string): void {
   if (owner) tokenCache.delete(owner);
   else tokenCache.clear();
+}
+
+/**
+ * Read a cached token, dropping it if it has expired.
+ *
+ * An expired entry is deleted rather than returned: the next caller then logs in
+ * once instead of every caller discovering the staleness through a 401.
+ */
+function cachedToken(owner: string, connectionId: string): string | undefined {
+  const entry = tokenCache.get(owner);
+  if (!entry) return undefined;
+  if (entry.connectionId !== connectionId || entry.expiresAt <= Date.now()) {
+    tokenCache.delete(owner);
+    return undefined;
+  }
+  return entry.token;
+}
+
+/**
+ * The expiry to cache a token under, from the JWT's own `exp` claim when it has
+ * one. A JWT is `header.payload.signature`; the payload is base64url JSON.
+ * Any parse failure yields the conservative default rather than throwing —
+ * this only ever shortens how long a token is reused.
+ */
+function tokenExpiryMs(token: string): number {
+  const fallback = Date.now() + TOKEN_CACHE_TTL_MS;
+  const parts = token.split(".");
+  if (parts.length !== 3 || !parts[1]) return fallback;
+  try {
+    const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8")) as {
+      exp?: unknown;
+    };
+    if (typeof payload.exp !== "number" || !Number.isFinite(payload.exp)) return fallback;
+    // Seconds since the epoch -> ms, minus a margin so the token is refreshed
+    // before the server considers it expired rather than after.
+    //
+    // A time already in the past is returned as-is rather than replaced with the
+    // fallback: substituting a future TTL there would keep serving a token the
+    // server has already expired, which is exactly what this cache exists to
+    // prevent. cachedToken() sees the past value and re-authenticates instead.
+    return payload.exp * 1000 - TOKEN_EXPIRY_MARGIN_MS;
+  } catch {
+    return fallback;
+  }
 }
 
 export interface CasaOSClientOptions {
@@ -441,6 +557,12 @@ export interface CasaOSClientOptions {
    * trusted LANs: the CasaOS password and API token then travel in cleartext.
    */
   allowInsecureHttp?: boolean;
+  /**
+   * M3: return raw log text. Off by default — redaction is best-effort, so
+   * log text that survives it can still carry a secret, and this client hands
+   * its results to a third-party model provider.
+   */
+  logToModel?: boolean;
 }
 
 export class CasaOSClient {
@@ -457,8 +579,8 @@ export class CasaOSClient {
   }
 
   private async accessToken(creds: CasaOSCredentials): Promise<string> {
-    const cached = tokenCache.get(this.options.owner);
-    if (cached && cached.connectionId === creds.connectionId) return cached.token;
+    const cached = cachedToken(this.options.owner, creds.connectionId);
+    if (cached) return cached;
     let response: Response;
     try {
       response = await fetch(`${this.options.baseUrl}/v1/users/login`, {
@@ -484,7 +606,11 @@ export class CasaOSClient {
       ?.access_token;
     if (typeof token !== "string" || !token)
       throw new AppError("CasaOS login did not return an access token.", 502);
-    tokenCache.set(this.options.owner, { token, connectionId: creds.connectionId });
+    tokenCache.set(this.options.owner, {
+      token,
+      connectionId: creds.connectionId,
+      expiresAt: tokenExpiryMs(token),
+    });
     return token;
   }
 
@@ -629,8 +755,8 @@ export class CasaOSClient {
     const encoded = await this.validateApp(app);
     const creds = await this.credentials();
     let token: string;
-    const cached = tokenCache.get(this.options.owner);
-    if (cached && cached.connectionId === creds.connectionId) token = cached.token;
+    const cached = cachedToken(this.options.owner, creds.connectionId);
+    if (cached) token = cached;
     else token = await this.accessToken(creds);
     const wantLines = typeof tailLines === "number" && tailLines > 0 ? tailLines : 500;
     const fetchLogs = async (auth: string): Promise<Response> =>
@@ -687,9 +813,20 @@ export class CasaOSClient {
     const { text, truncated } = truncateToTail(capped, LOG_TAIL_BYTES);
     const lines = text.split("\n");
     const tail = typeof tailLines === "number" && tailLines > 0 ? lines.slice(-tailLines) : lines;
+    const wasTruncated = rawOverTailCap || cappedTruncated || truncated;
+    // M3: default to shape only. The text is still read, redacted and bounded
+    // above (the summary is derived from it), but it is not returned unless the
+    // operator deliberately opted in.
+    if (!this.options.logToModel)
+      return {
+        lines: [],
+        truncated: wasTruncated,
+        redacted: true,
+        summary: summarizeCasaOSLogs(tail, { truncated: wasTruncated }),
+      };
     return {
       lines: tail,
-      truncated: rawOverTailCap || cappedTruncated || truncated,
+      truncated: wasTruncated,
       redacted: true,
     };
   }
