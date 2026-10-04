@@ -257,6 +257,14 @@ const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
  * the configured URL is sufficient.
  */
 export function assertCasaOSUrlAllowed(baseUrl: string, allowInsecureHttp: boolean): void {
+  // M1: fail closed on an unset URL rather than falling back to a default
+  // address. The message names the variable because this is a configuration
+  // error, not a CasaOS outage.
+  if (!baseUrl.trim())
+    throw new AppError(
+      "CASAOS_API_URL is not set. Point it at your CasaOS address (for example https://casaos.local:1443) and restart OpenMuse.",
+      503,
+    );
   let url: URL;
   try {
     url = new URL(baseUrl);
