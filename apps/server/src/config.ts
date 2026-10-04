@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { parseEnv } from "node:util";
+import { assertValidEncryptionKey } from "../../../packages/integrations/src/vault.ts";
 
 /** .env keys whose file value loses to a different value already set in the environment. */
 export function shadowedEnvKeys(
@@ -53,6 +54,23 @@ export interface Config {
   computerImage?: string;
   computerDeploymentId?: string;
   allowedOrigins: string[];
+  casaosApiUrl: string;
+  casaosProtectedApps: string[];
+  /** Opt out of the HTTPS/loopback transport policy (trusted LANs only). */
+  casaosAllowInsecureHttp?: boolean;
+  /**
+   * Every CasaOS app that hosts OpenMuse or its network access, by the exact
+   * name it is installed under. Complements the lexical `casaosProtectedApps`
+   * list: that list only matches names it was told about, so an installation
+   * named anything else needs to be declared here.
+   */
+  casaosSelfApps: string[];
+  /**
+   * M3: send raw CasaOS log text to the model provider. Defaults to false
+   * because redaction is best-effort and cannot cover a bespoke log format.
+   * When false, casaos_app_logs returns a shape summary instead of text.
+   */
+  casaosLogToModel: boolean;
 }
 
 /** Pinned so live rankings do not shift when TypeSafe moves the `jev-latest` alias. */
@@ -140,7 +158,29 @@ export function readConfig(): Config {
     allowedOrigins: (
       process.env.ALLOWED_ORIGINS ?? "http://localhost:8081,http://127.0.0.1:8081"
     ).split(","),
+    // M1: no default address. A hardcoded fallback committed one operator's LAN
+    // topology to the repository and, with CASAOS_ALLOW_INSECURE_HTTP=true,
+    // sent the CasaOS password to whatever device later held that
+    // DHCP-assigned IP. An unset URL now fails closed in
+    // assertCasaOSUrlAllowed with a message naming the variable.
+    casaosApiUrl: (process.env.CASAOS_API_URL ?? "").replace(/\/+$/, ""),
+    casaosAllowInsecureHttp: process.env.CASAOS_ALLOW_INSECURE_HTTP === "true",
+    casaosProtectedApps: (process.env.CASAOS_PROTECTED_APPS ?? "openmuse,tailscale,casaos")
+      .split(",")
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean),
+    casaosSelfApps: (process.env.CASAOS_SELF_APPS ?? "")
+      .split(",")
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean),
+    casaosLogToModel: process.env.CASAOS_LOG_TO_MODEL === "true",
   };
+  if (config.encryptionKey) {
+    // Fail fast on a malformed key: encryptSecret/decryptSecret would throw
+    // the same error at first use, but a bad key here means credentials can
+    // never be saved or read, so surface it at startup/config time.
+    assertValidEncryptionKey(config.encryptionKey);
+  }
   if (
     mode === "live" &&
     (!config.accessKey || config.accessKey.length < 24 || !config.encryptionKey)
@@ -150,5 +190,33 @@ export function readConfig(): Config {
     );
   if (mode === "sample" && !["127.0.0.1", "localhost", "::1"].includes(config.host))
     throw new Error("Sample workspace is local-only. HOST must be a loopback address.");
+  warnAboutCasaOSProtection(config);
   return config;
+}
+
+/** The built-in protected list, before any operator override. */
+const DEFAULT_PROTECTED_APPS = "openmuse,tailscale,casaos";
+
+/**
+ * M2: the protected-app guard is lexical, so it only protects the names it was
+ * told about. An operator who installs OpenMuse on CasaOS under any other name
+ * leaves the app hosting the agent unguarded: the agent can then be told to
+ * stop the machine it runs on. The guard cannot be made exhaustive by guessing
+ * names, so this warns at startup instead, naming the variable that closes the
+ * gap. Warnings only — a deployment that is correctly named must still start.
+ */
+export function warnAboutCasaOSProtection(config: Config): string[] {
+  const warnings: string[] = [];
+  if (!config.casaosApiUrl) return warnings;
+  if (!process.env.CASAOS_PROTECTED_APPS && !config.casaosSelfApps.length)
+    warnings.push(
+      `[OpenMuse] CasaOS is configured but neither CASAOS_PROTECTED_APPS nor CASAOS_SELF_APPS is set, so only the built-in list (${DEFAULT_PROTECTED_APPS}) and the "openmuse-" prefix are protected. ` +
+        "If OpenMuse runs on CasaOS under a different app name, add it to CASAOS_SELF_APPS, or the agent could be asked to stop the app hosting it.",
+    );
+  else if (!config.casaosSelfApps.length)
+    warnings.push(
+      "[OpenMuse] CASAOS_SELF_APPS is empty. Set it to every CasaOS app that hosts OpenMuse or its network access, so they are protected by identity and not only by name pattern.",
+    );
+  for (const warning of warnings) console.warn(warning);
+  return warnings;
 }

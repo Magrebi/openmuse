@@ -125,7 +125,23 @@ export const proposalSchema = z.discriminatedUnion("kind", [
     kind: z.literal("calendar.delete"),
     data: z.object({ calendarId: z.string(), eventId: z.string().min(1), title: z.string() }),
   }),
+  z.object({
+    kind: z.literal("casaos.action"),
+    data: z.object({
+      app: z.string().min(1).max(128),
+      action: z.enum(["start", "stop", "restart"]),
+      // Model-provided context. Rendered separately and labeled; never part of the
+      // verified action text and never passed to the CasaOS API.
+      note: z.string().max(500).optional(),
+    }),
+  }),
 ]);
+export const casaOSActionSchema = z.object({
+  app: z.string().min(1).max(128),
+  action: z.enum(["start", "stop", "restart"]),
+  note: z.string().max(500).optional(),
+});
+export type CasaOSAction = z.infer<typeof casaOSActionSchema>;
 export type EmailDraft = z.infer<typeof emailDraftSchema>;
 export type EventDraft = z.infer<typeof eventDraftSchema>;
 export type ProposalInput = z.infer<typeof proposalSchema>;
@@ -153,6 +169,13 @@ export interface ActionProposal {
   expiresAt: string;
   result?: string;
   error?: string;
+  /**
+   * Transient (never persisted): true when this proposal object was returned
+   * from a replay of an already-terminal record rather than a fresh review or
+   * execution. Lets tool handlers annotate the result so the model cannot
+   * present a re-skipped action as freshly executed.
+   */
+  replayed?: boolean;
 }
 export interface ActivityEntry {
   id: string;

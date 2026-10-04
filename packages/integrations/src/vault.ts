@@ -8,6 +8,11 @@ function decodeKey(key: string): Buffer {
   return bytes;
 }
 
+/** Throws unless `key` is a 32-byte base64 string (strict round-trip). */
+export function assertValidEncryptionKey(key: string): void {
+  decodeKey(key);
+}
+
 /**
  * The additional authenticated data every credential envelope is bound to.
  *
