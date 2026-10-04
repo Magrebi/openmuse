@@ -28,6 +28,10 @@ const config = (dir: string) => ({
   agentBackend: "sample" as const,
   googleRedirectUri: "http://localhost:8787/api/google/callback",
   allowedOrigins: [],
+  casaosApiUrl: "http://127.0.0.1",
+  casaosProtectedApps: ["openmuse", "tailscale", "casaos"],
+  casaosSelfApps: [],
+  casaosLogToModel: false,
   intelligenceApiKey: "test-key",
 });
 

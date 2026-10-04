@@ -14,6 +14,10 @@ export const config: Config = {
   intelligenceApiKey: "test-project-key-never-sent",
   googleRedirectUri: "http://localhost/callback",
   allowedOrigins: [],
+  casaosApiUrl: "http://127.0.0.1",
+  casaosProtectedApps: ["openmuse", "tailscale", "casaos"],
+  casaosSelfApps: [],
+  casaosLogToModel: false,
   computerEnabled: true,
 };
 export const ok = (stdout = ""): DockerResult => ({

@@ -23,6 +23,10 @@ before(async () => {
     intelligenceApiKey: "test-project-key-never-sent",
     googleRedirectUri: "http://localhost:8787/api/google/callback",
     allowedOrigins: [],
+    casaosApiUrl: "http://127.0.0.1",
+    casaosProtectedApps: ["openmuse", "tailscale", "casaos"],
+    casaosSelfApps: [],
+    casaosLogToModel: false,
   });
   await server.workspace.ensureSample(owner, server.actions);
 });

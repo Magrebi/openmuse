@@ -22,6 +22,10 @@ before(async () => {
     agentBackend: "sample",
     googleRedirectUri: "http://localhost:8787/api/google/callback",
     allowedOrigins: ["http://localhost:8081"],
+    casaosApiUrl: "http://127.0.0.1",
+    casaosProtectedApps: ["openmuse", "tailscale", "casaos"],
+    casaosSelfApps: [],
+    casaosLogToModel: false,
     intelligenceApiKey: "test-project-key-never-sent",
   }));
   const session = await app.request("/api/session", {

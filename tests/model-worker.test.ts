@@ -691,6 +691,10 @@ test("CopilotKit model worker executes server tools and persists the confirmed o
       model: "openai/fixture",
       googleRedirectUri: "http://localhost:8787/api/google/callback",
       allowedOrigins: [],
+      casaosApiUrl: "http://127.0.0.1",
+      casaosProtectedApps: ["openmuse", "tailscale", "casaos"],
+      casaosSelfApps: [],
+      casaosLogToModel: false,
       computerEnabled: true,
     },
     { docker: computerFixture().runner },
@@ -787,6 +791,10 @@ test("the model worker keeps the text a model replies with when it calls no tool
     model: demoModel,
     googleRedirectUri: "http://localhost:8787/api/google/callback",
     allowedOrigins: [],
+    casaosApiUrl: "http://127.0.0.1",
+    casaosProtectedApps: ["openmuse", "tailscale", "casaos"],
+    casaosSelfApps: [],
+    casaosLogToModel: false,
   });
   try {
     const task = await server.agent.createTask("owner", { prompt: "Plan my week" });
@@ -831,6 +839,10 @@ test("replaying a completed prepared action returns its receipt without reopenin
     model: "openai/fixture",
     googleRedirectUri: "http://localhost:8787/api/google/callback",
     allowedOrigins: [],
+    casaosApiUrl: "http://127.0.0.1",
+    casaosProtectedApps: ["openmuse", "tailscale", "casaos"],
+    casaosSelfApps: [],
+    casaosLogToModel: false,
   });
   try {
     const task = await server.agent.createTask("replay-owner", {

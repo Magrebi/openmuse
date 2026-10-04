@@ -42,6 +42,10 @@ export async function browserFixture(
     intelligenceApiKey: "test-project-key-never-sent",
     googleRedirectUri: "http://localhost:8787/api/google/callback",
     allowedOrigins: [],
+    casaosApiUrl: "http://127.0.0.1",
+    casaosProtectedApps: ["openmuse", "tailscale", "casaos"],
+    casaosSelfApps: [],
+    casaosLogToModel: false,
     workerUrl: `http://127.0.0.1:${address.port}`,
     workerToken: "test-worker-token-at-least-32-characters",
   };

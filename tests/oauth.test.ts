@@ -25,6 +25,10 @@ function oauthConfig(): Config {
     dataDir: "unused",
     agentBackend: "model",
     allowedOrigins: [],
+    casaosApiUrl: "http://127.0.0.1",
+    casaosProtectedApps: ["openmuse", "tailscale", "casaos"],
+    casaosSelfApps: [],
+    casaosLogToModel: false,
     googleRedirectUri: "http://localhost:8787/api/google/callback",
     googleClientId: "synthetic-client",
     googleClientSecret: "synthetic-secret",
@@ -45,6 +49,10 @@ test("old refresh cannot overwrite a newly connected Google account", async (t) 
     agentBackend: "model",
     googleRedirectUri: "http://localhost:8787/api/google/callback",
     allowedOrigins: [],
+    casaosApiUrl: "http://127.0.0.1",
+    casaosProtectedApps: ["openmuse", "tailscale", "casaos"],
+    casaosSelfApps: [],
+    casaosLogToModel: false,
     encryptionKey: key,
   };
   const a = {
@@ -104,6 +112,10 @@ test("OAuth callbacks require a known, single-use state", async (t) => {
     agentBackend: "model",
     googleRedirectUri: "http://localhost:8787/api/google/callback",
     allowedOrigins: [],
+    casaosApiUrl: "http://127.0.0.1",
+    casaosProtectedApps: ["openmuse", "tailscale", "casaos"],
+    casaosSelfApps: [],
+    casaosLogToModel: false,
   };
   const auth = new GoogleAuth(db, config);
   await assert.rejects(auth.callback("unknown-state", "untrusted-code"), /expired/);
