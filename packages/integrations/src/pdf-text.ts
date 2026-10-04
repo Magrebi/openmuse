@@ -27,12 +27,30 @@ export const MAX_TEXT_PER_PAGE = 4000;
 const MIN_PRINTABLE_RATIO = 0.6;
 /** Appended when the budget cuts a page short, so a partial read is never silent. */
 const TRUNCATION_MARKER = "\n[truncated]";
+/**
+ * Ceiling on one decompressed content stream.
+ *
+ * `MAX_PDF_BYTES` caps the document on disk, but Flate expands by three orders of
+ * magnitude, so a 10 MB upload can inflate to gigabytes and exhaust the process.
+ * `maxOutputLength` makes zlib stop at the cap; the stream is then reported as
+ * unreadable rather than the read being allowed to run the server out of memory.
+ */
+const MAX_STREAM_BYTES = 32 * 1024 * 1024;
+/** `String.fromCharCode` is variadic and takes one stack frame per argument. */
+const LATIN1_CHUNK = 8192;
 
 export interface PdfPageText {
   readonly page: number;
   readonly text: string;
   /** True when the page holds images or an encoding this extractor cannot read. */
   readonly unextractable: boolean;
+  /**
+   * True when the page was never read because the budget ran out on an earlier
+   * page. It is deliberately *not* `unextractable`: the text is there and a
+   * later read will get it, so telling the caller it cannot be decoded would
+   * make the agent report a readable page as a scan.
+   */
+  readonly budgetExhausted?: boolean;
 }
 
 /**
@@ -58,7 +76,21 @@ function contentStreams(
   return contents instanceof PDFRawStream ? [contents] : [];
 }
 
-const LATIN1 = (bytes: Uint8Array) => String.fromCharCode(...bytes);
+/**
+ * Latin-1 decode of an arbitrarily long buffer.
+ *
+ * `String.fromCharCode(...bytes)` passes one argument per byte, so a content
+ * stream past roughly 125 KB — ordinary for a vector-heavy page — throws
+ * `RangeError: Maximum call stack size exceeded`. Decoding in fixed slices keeps
+ * the result identical while staying off the stack limit.
+ */
+const LATIN1 = (bytes: Uint8Array): string => {
+  if (bytes.length <= LATIN1_CHUNK) return String.fromCharCode(...bytes);
+  let text = "";
+  for (let at = 0; at < bytes.length; at += LATIN1_CHUNK)
+    text += String.fromCharCode(...bytes.subarray(at, at + LATIN1_CHUNK));
+  return text;
+};
 
 /** The WinAnsi codes for 0x80–0x9F; the rest of the range matches Latin-1. */
 const WIN_ANSI_HIGH: Record<number, string> = {
@@ -179,7 +211,12 @@ function extractFromStream(stream: PDFRawStream): string {
     .map((entry) => entry.toString().replace(/^\//, ""));
   if (filters.includes("FlateDecode")) {
     try {
-      bytes = new Uint8Array(inflateSync(Buffer.from(bytes)));
+      // `maxOutputLength` bounds the expansion. Without it a small upload can
+      // inflate to gigabytes and take the process down; over the cap this throws
+      // and the stream degrades to no text, which is the honest answer anyway.
+      bytes = new Uint8Array(
+        inflateSync(Buffer.from(bytes), { maxOutputLength: MAX_STREAM_BYTES }),
+      );
     } catch {
       return "";
     }
@@ -233,12 +270,16 @@ export function extractPdfText(
   const pages = doc.getPages();
   const from = options.from ?? 1;
   const to = options.to ?? pages.length;
+  // `to` is checked as well as `from`: the `read_pdf` tool accepts any page up
+  // to 500, so a range running past the end used to invent that many empty
+  // entries and report them to the model as pages it could not read.
   if (
     !Number.isInteger(from) ||
     !Number.isInteger(to) ||
     from < 1 ||
     to < from ||
-    from > pages.length
+    from > pages.length ||
+    to > pages.length
   )
     throw new RangeError(`Pages ${from}-${to} are outside a ${pages.length}-page document`);
   const budget = options.maxChars ?? MAX_TEXT_PER_PAGE * 4;
@@ -268,10 +309,11 @@ export function extractPdfText(
       spent += text.length;
     }
     results.push({ page: index, text, unextractable });
-    // Say plainly which pages were never reached instead of stopping silently.
+    // Say which pages were never reached instead of stopping silently, and say
+    // it as a budget cutoff rather than as a decode failure.
     if (spent >= budget) {
       for (let rest = index + 1; rest <= to; rest++)
-        results.push({ page: rest, text: "", unextractable: true });
+        results.push({ page: rest, text: "", unextractable: false, budgetExhausted: true });
       break;
     }
   }

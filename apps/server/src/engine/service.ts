@@ -172,7 +172,15 @@ export class AgentService {
       // Filtered in the database: these accumulate for every task the owner has
       // ever run, so a full list would scan all of them to show one task.
       events: await this.db.listWhere<RunEvent>(owner, "run-events", "taskId", id),
-      artifacts: await this.db.listWhere<AgentArtifact>(owner, "agent-artifacts", "taskId", id),
+      // Artifacts carry `createdAt`, not `date`, so they are ordered newest first
+      // by the store's own column — the order the previous full list produced.
+      artifacts: await this.db.listWhere<AgentArtifact>(
+        owner,
+        "agent-artifacts",
+        "taskId",
+        id,
+        "updated_desc",
+      ),
     };
   }
   async createTask(owner: string, raw: unknown, idempotencyKey?: string, held = false) {
