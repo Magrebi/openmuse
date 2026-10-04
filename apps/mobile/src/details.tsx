@@ -40,6 +40,7 @@ import { BrowserMirror } from "./browser-mirror";
 import { ComputerSheet } from "./computer";
 import DateTimeEditor from "./DateTimeEditor";
 import { localDateTime, zonedInstant } from "./date-time";
+import { DiffActions, DiffEditor } from "./diff-editor";
 import PdfReader from "./PdfReader";
 import {
   Button,
@@ -540,6 +541,10 @@ function ReviewDetail({ initial }: { initial: ActionProposal }) {
   const [local, setLocal] = useState(initial);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  // The reviewer's pending wording. Seeded from the proposal, and deliberately
+  // separate from `local`: saving is an explicit step, so the card can show both
+  // what was proposed and what will be sent until it is.
+  const [edited, setEdited] = useState<Record<string, string>>({});
   const action =
     local.status !== initial.status ? local : w.actions.find((a) => a.id === initial.id) || local;
   const d = action.data;
@@ -560,7 +565,31 @@ function ReviewDetail({ initial }: { initial: ActionProposal }) {
       setBusy(false);
     }
   }
-  async function edit() {
+  /**
+   * Save the reviewer's wording back onto the proposal.
+   *
+   * The server recomputes the hash, so the returned proposal must become the
+   * local one: approving with the old hash afterwards would fail, and that
+   * failure is the security property working, not a bug to work around.
+   */
+  async function saveEdits() {
+    setBusy(true);
+    setError("");
+    try {
+      const saved = await api.request<ActionProposal>(`/api/actions/${action.id}/amend`, {
+        hash: action.hash,
+        data: edited,
+      });
+      setLocal(saved);
+      setEdited({});
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+  const edit = async () => {
     setBusy(true);
     setError("");
     try {
@@ -587,7 +616,7 @@ function ReviewDetail({ initial }: { initial: ActionProposal }) {
     } finally {
       setBusy(false);
     }
-  }
+  };
   const email = action.kind === "email.send";
   return (
     <Sheet
@@ -618,11 +647,38 @@ function ReviewDetail({ initial }: { initial: ActionProposal }) {
             <ReviewLine label="To" value={arrayText(d.to)} />
             <ReviewLine label="Cc" value={arrayText(d.cc) || "None"} />
             <ReviewLine label="Bcc" value={arrayText(d.bcc) || "None"} />
-            <ReviewLine label="Subject" value={String(d.subject || "")} />
-            <View style={s.divider} />
-            <Text selectable style={[s.text, { lineHeight: 25 }]}>
-              {String(d.body || "")}
-            </Text>
+            {pending ? (
+              <>
+                <DiffEditor
+                  label="Subject"
+                  draft={String(d.subject || "")}
+                  multiline={false}
+                  minHeight={44}
+                  onChange={(next) => setEdited((prev) => ({ ...prev, subject: next }))}
+                />
+                <View style={s.divider} />
+                <DiffEditor
+                  label="Message"
+                  draft={String(d.body || "")}
+                  onChange={(next) => setEdited((prev) => ({ ...prev, body: next }))}
+                />
+                <DiffActions
+                  busy={busy}
+                  canSave={Object.keys(edited).length > 0}
+                  canRevert={Object.keys(edited).length > 0}
+                  onSave={() => void saveEdits()}
+                  onRevert={() => setEdited({})}
+                />
+              </>
+            ) : (
+              <>
+                <ReviewLine label="Subject" value={String(d.subject || "")} />
+                <View style={s.divider} />
+                <Text selectable style={[s.text, { lineHeight: 25 }]}>
+                  {String(d.body || "")}
+                </Text>
+              </>
+            )}
             <View style={s.divider} />
             <Text style={s.label}>Attachments</Text>
             {Array.isArray(d.attachmentIds) && d.attachmentIds.length ? (
@@ -705,7 +761,9 @@ function ReviewDetail({ initial }: { initial: ActionProposal }) {
                   ? "Approve & send"
                   : "Approve change"}
             </Button>
-            {action.kind !== "calendar.delete" && (
+            {/* Editing happens in place above, so the old deny-and-reopen route is kept
+                only for calendar changes, which need the full event editor. */}
+            {action.kind !== "calendar.delete" && !email && (
               <Button icon={Edit3} disabled={busy} onPress={() => void edit()}>
                 Edit details
               </Button>

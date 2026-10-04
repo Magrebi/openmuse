@@ -5,7 +5,11 @@ import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { cors } from "hono/cors";
 import { z } from "zod";
-import { emailDraftSchema, proposalSchema } from "../../../packages/domain/src/index.ts";
+import {
+  type ActionProposal,
+  emailDraftSchema,
+  proposalSchema,
+} from "../../../packages/domain/src/index.ts";
 import { ActionService } from "./actions.ts";
 import { agentConfigured, makeRuntime } from "./agent.ts";
 import { createAuth } from "./auth.ts";
@@ -190,6 +194,24 @@ export async function createApp(
     return c.json(
       await actions.decide(c.get("owner"), c.req.param("id"), body.hash, body.decision),
     );
+  });
+  app.post("/api/actions/:id/amend", async (c) => {
+    const body = z
+      .object({ hash: z.string(), data: z.record(z.string(), z.unknown()) })
+      .parse(await c.req.json());
+    const owner = c.get("owner");
+    // An amendment can introduce an attachment id the proposal never had, so the
+    // ownership check `propose` does has to happen here too. Without it this is a
+    // way to attach another owner's file to an outbound email.
+    const existing = await db.get<ActionProposal>(owner, "actions", c.req.param("id"));
+    if (!existing) throw new AppError("Action not found", 404);
+    if (existing.kind === "email.send") {
+      const attachmentIds = Array.isArray(body.data.attachmentIds)
+        ? body.data.attachmentIds.filter((id): id is string => typeof id === "string")
+        : [];
+      for (const id of attachmentIds) await files.get(owner, id);
+    }
+    return c.json(await actions.amend(owner, c.req.param("id"), body.hash, body.data));
   });
   app.get("/api/drafts", async (c) => c.json(await db.list(c.get("owner"), "drafts")));
   app.post("/api/drafts", async (c) => {

@@ -99,6 +99,92 @@ export class ActionService {
     await this.record(owner, saved, "Ready for your review");
     return saved;
   }
+  /**
+   * Rewrite a proposal that is still waiting for review.
+   *
+   * Editing inside the approval card is the obvious thing to want: the agent
+   * drafted something nearly right and the fix is a word, not a new round trip
+   * through a separate editor that throws the proposal away.
+   *
+   * The constraint that shapes this is the hash. It exists so that an approval
+   * can only ever apply to the exact bytes the reviewer saw, and it is checked
+   * at decide time. If an amendment could change the payload while leaving the
+   * hash alone, that guarantee would quietly become false — a reviewer approves
+   * what was displayed and something else is sent. So an amendment recomputes
+   * the hash over the new input, which means the client must approve again with
+   * the hash it gets back. That is the point: the edit is a new thing to review,
+   * and it gets reviewed as one.
+   *
+   * The write is a compare-and-swap on the status, hash and expiry together.
+   * Checking them with a read and then writing would leave a window in which an
+   * approval that arrived mid-amendment could execute the old payload while the
+   * stored row claimed the new one.
+   */
+  async amend(
+    owner: string,
+    id: string,
+    hash: string,
+    patch: Record<string, unknown>,
+  ): Promise<ActionProposal> {
+    const proposal = await this.db.get<ActionProposal>(owner, "actions", id);
+    if (!proposal) throw new AppError("Action not found", 404);
+    if (proposal.hash !== hash)
+      throw new AppError("This proposal changed. Open its latest review before deciding.", 409);
+    if (proposal.status !== "awaiting_review")
+      throw new AppError("This action is no longer open for review.", 409);
+    if (Date.parse(proposal.expiresAt) <= this.now())
+      throw new AppError("This review expired. Create a fresh proposal.", 409);
+
+    // `kind` selects the schema, the executor and the target version, so it must
+    // not be reachable through the patch. The schema would strip it anyway, but
+    // only because these objects happen to be strict; refusing it outright means
+    // the invariant does not rest on that.
+    if ("kind" in patch)
+      throw new AppError("An action's kind cannot be changed during review.", 409);
+    const input = proposalSchema.parse({
+      kind: proposal.kind,
+      data: { ...proposal.data, ...patch },
+    });
+    const connection = await this.options.connection?.(owner);
+    if (this.options.connection && !connection)
+      throw new AppError("Connect Google before preparing an action", 409);
+    // Re-prepared rather than reused: a calendar update's target version is the
+    // event's own version, and it must describe the event as it is now, not as
+    // it was when the agent first drafted this.
+    const prepared = await this.options.prepare?.(owner, input, connection?.id);
+    const final = proposalSchema.parse(prepared?.input ?? input);
+    const nextHash = createHash("sha256")
+      .update(
+        JSON.stringify({
+          input: final,
+          connection,
+          target: prepared?.target,
+          targetVersion: prepared?.targetVersion,
+        }),
+      )
+      .digest("hex");
+    const amended = await this.db.compareAndSwap<ActionProposal>(
+      owner,
+      "actions",
+      id,
+      { status: "awaiting_review", hash, expiresAt: proposal.expiresAt },
+      {
+        data: final.data,
+        target: prepared?.target ?? proposal.target,
+        targetVersion: prepared?.targetVersion ?? proposal.targetVersion,
+        hash: nextHash,
+      },
+    );
+    if (!amended) {
+      // Someone decided while this amendment was being prepared.
+      const current = await this.db.get<ActionProposal>(owner, "actions", id);
+      if (!current) throw new AppError("Action not found", 404);
+      throw new AppError("This action was decided while it was being edited.", 409);
+    }
+    await this.record(owner, amended, "Edited during review; review the updated details");
+    return amended;
+  }
+
   async decide(
     owner: string,
     id: string,

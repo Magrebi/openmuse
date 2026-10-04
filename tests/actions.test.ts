@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
+import { z } from "zod";
 import { ActionService } from "../apps/server/src/actions.ts";
 import { createStore, type Store } from "../apps/server/src/db.ts";
 import { type ActionProposal, eventDraftSchema } from "../packages/domain/src/index.ts";
@@ -284,4 +285,183 @@ test("an expired stale review cannot overwrite a concurrently executing action",
   finishExecution.resolve("sent");
   await approval;
   assert.equal(saved?.status, "executing");
+});
+
+/** A service that records exactly what it was asked to execute. */
+function recorder() {
+  const seen: { subject: string; body: string }[] = [];
+  const service = new ActionService(db, {
+    execute: async (_owner, input) => {
+      if (input.kind === "email.send")
+        seen.push({ subject: input.data.subject, body: input.data.body });
+      return "sent";
+    },
+    connected: async () => true,
+  });
+  return { service, seen };
+}
+
+test("an amendment changes what is executed", async () => {
+  const { service, seen } = recorder();
+  const proposal = await service.propose("amend-user", email);
+  const amended = await service.amend("amend-user", proposal.id, proposal.hash, {
+    subject: "Visit on Saturday",
+  });
+  assert.equal(amended.data.subject, "Visit on Saturday");
+  assert.equal(amended.status, "awaiting_review", "an edit must not decide the action");
+  await service.decide("amend-user", proposal.id, amended.hash, "approve");
+  assert.deepEqual(seen, [{ subject: "Visit on Saturday", body: "See attached." }]);
+});
+
+test("an amendment invalidates the hash it was reviewed under", async () => {
+  // The whole security property of the hash. If the payload could change while
+  // the hash survived, a reviewer would approve the text they read and something
+  // else would be sent.
+  const { service } = recorder();
+  const proposal = await service.propose("hash-user", email);
+  const amended = await service.amend("hash-user", proposal.id, proposal.hash, {
+    body: "totally different",
+  });
+  assert.notEqual(amended.hash, proposal.hash);
+  await assert.rejects(
+    service.decide("hash-user", proposal.id, proposal.hash, "approve"),
+    /changed/,
+    "the superseded hash must no longer be able to approve",
+  );
+});
+
+test("an amendment only changes the fields it names", async () => {
+  // A patch is a patch, not a replacement: sending only the subject must not
+  // silently drop the recipients.
+  const { service } = recorder();
+  const proposal = await service.propose("partial-user", email);
+  const amended = await service.amend("partial-user", proposal.id, proposal.hash, {
+    subject: "New subject",
+  });
+  assert.deepEqual(amended.data.to, ["sam@example.com"]);
+  assert.equal(amended.data.body, "See attached.");
+});
+
+test("a decided action cannot be amended", async () => {
+  const { service } = recorder();
+  const proposal = await service.propose("decided-user", email);
+  await service.decide("decided-user", proposal.id, proposal.hash, "deny");
+  await assert.rejects(
+    service.amend("decided-user", proposal.id, proposal.hash, { subject: "too late" }),
+    /no longer open for review/,
+  );
+});
+
+test("one person cannot amend another person's proposal", async () => {
+  const { service } = recorder();
+  const proposal = await service.propose("owner-a", email);
+  await assert.rejects(
+    service.amend("owner-b", proposal.id, proposal.hash, { subject: "not mine" }),
+    /not found/,
+  );
+});
+
+test("an amendment is validated against the proposal schema", async () => {
+  // Otherwise the executor receives a payload nothing has checked, which is the
+  // one thing the review gate exists to prevent.
+  const { service } = recorder();
+  const proposal = await service.propose("schema-user", email);
+  await assert.rejects(
+    service.amend("schema-user", proposal.id, proposal.hash, { to: "not-an-array" }),
+    /Invalid|expected|array/i,
+  );
+  const saved = await db.get<ActionProposal>("schema-user", "actions", proposal.id);
+  assert.deepEqual(saved?.data.to, ["sam@example.com"], "a rejected patch must not be stored");
+});
+
+test("an expired review cannot be amended", async () => {
+  const { service } = recorder();
+  const proposal = await service.propose("expired-user", email);
+  await db.put("expired-user", "actions", {
+    ...proposal,
+    expiresAt: new Date(0).toISOString(),
+  });
+  await assert.rejects(
+    service.amend("expired-user", proposal.id, proposal.hash, { subject: "zombie" }),
+    /expired/,
+  );
+});
+
+test("an amendment that loses the race with a decision does not resurrect it", async () => {
+  // The compare-and-swap is what makes this safe. Check-then-write would let the
+  // edit land on an action that had already been approved for execution.
+  const finish = deferred<string>();
+  const service = new ActionService(db, {
+    execute: async () => finish.promise,
+    connected: async () => true,
+  });
+  const proposal = await service.propose("race-user", email);
+  const approval = service.decide("race-user", proposal.id, proposal.hash, "approve");
+  await assert.rejects(
+    service.amend("race-user", proposal.id, proposal.hash, { subject: "too late" }),
+    /decided while it was being edited|no longer open/,
+  );
+  finish.resolve("sent");
+  await approval;
+  const saved = await db.get<ActionProposal>("race-user", "actions", proposal.id);
+  assert.equal(saved?.data.subject, email.data.subject, "the edit must not have been applied");
+});
+
+test("an amendment cannot smuggle in a different kind of action", async () => {
+  // `kind` selects the schema, the executor and the target version. Letting it
+  // move through the data patch would let a review approved for one kind be
+  // turned into an execution of another.
+  const { service } = recorder();
+  const proposal = await service.propose("kind-user", email);
+  await assert.rejects(
+    service.amend("kind-user", proposal.id, proposal.hash, {
+      kind: "calendar.delete",
+      eventId: "somebody-elses-event",
+    }),
+    /kind cannot be changed/,
+  );
+  const saved = await db.get<ActionProposal>("kind-user", "actions", proposal.id);
+  assert.equal(saved?.kind, "email.send", "the kind must not have moved");
+});
+
+test("an amendment re-prepares so the target version is current", async () => {
+  // A calendar update's target version is the event's own version. Reusing the one
+  // captured when the agent first drafted would let an edit execute against a
+  // stale read and silently overwrite someone else's change.
+  const versions = ["v1", "v2"];
+  let calls = 0;
+  const service = new ActionService(db, {
+    execute: async () => "updated",
+    connected: async () => true,
+    prepare: async () => {
+      const targetVersion = versions[calls++];
+      return {
+        input: {
+          kind: "calendar.update" as const,
+          data: eventDraftSchema.and(z.object({ eventId: z.string().min(1) })).parse({
+            eventId: "e1",
+            title: "Standup",
+            start: "2026-03-02T09:00:00Z",
+            end: "2026-03-02T09:30:00Z",
+            timeZone: "UTC",
+          }),
+        },
+        target: { id: "e1", title: "Standup" } as never,
+        targetVersion,
+      };
+    },
+  });
+  const draft = eventDraftSchema.and(z.object({ eventId: z.string().min(1) })).parse({
+    eventId: "e1",
+    title: "Standup",
+    start: "2026-03-02T09:00:00Z",
+    end: "2026-03-02T09:30:00Z",
+    timeZone: "UTC",
+  });
+  const proposal = await service.propose("version-user", { kind: "calendar.update", data: draft });
+  assert.equal(proposal.targetVersion, "v1");
+  const amended = await service.amend("version-user", proposal.id, proposal.hash, {
+    title: "Standup (moved)",
+  });
+  assert.equal(amended.targetVersion, "v2", "the edit must see the current version");
 });
