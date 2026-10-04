@@ -6,7 +6,9 @@ you approve in the OpenMuse UI — start, stop or restart apps.
 ## Setup
 
 1. Set `TOKEN_ENCRYPTION_KEY` (32 random bytes, base64) and restart the API.
-2. If CasaOS is not at the default `http://192.168.4.27`, set `CASAOS_API_URL`.
+2. Set `CASAOS_API_URL` to your CasaOS address, for example
+   `https://casaos.local:1443`. **There is no default** — without it, CasaOS
+   stays disconnected with a 503 configuration error.
 3. In the OpenMuse UI open **Connections → CasaOS** and enter your CasaOS username
    and password. A live login happens before anything is stored, so a wrong
    password is rejected immediately and never saved.
@@ -37,23 +39,36 @@ prefer the Tailscale HTTPS address when away from home.
   to check the app's status instead of assuming.
 - Apps listed in `CASAOS_PROTECTED_APPS` (default `openmuse,tailscale,casaos`)
   can never be started, stopped or restarted — the request is rejected at
-  proposal time and again at execution time.
+  proposal time and again at execution time. Names beginning `openmuse-` are
+  also refused.
+- Set `CASAOS_SELF_APPS` to a comma-separated list of **every** CasaOS app that
+  hosts OpenMuse or its network access. The built-in list only matches the names
+  it knows, so if you installed OpenMuse under any other name, the agent could
+  otherwise be asked to stop the machine it runs on. A warning is printed at
+  startup while this is unset.
+- `casaos_app_logs` returns a **shape summary** by default — line count, error
+  and warning level tallies, and the line numbers that look notable — rather
+  than log text, because redaction is best-effort and cannot recognise every
+  application's own secret format. Set `CASAOS_LOG_TO_MODEL=true` to return
+  redacted text instead; only do that if you accept that a secret in an
+  unrecognised log format would be sent to your model provider.
 - Logs are redacted (API keys, Bearer tokens, JWTs, URL credentials,
   `password=`-style assignments) and capped to an 8KB tail. App compose
   output never includes `environment` blocks.
 
 ## CasaOS address
 
-`CASAOS_API_URL` defaults to `http://192.168.4.27`. If your router assigns a
-different address via DHCP, update the variable and restart the API. From inside
-the API container, `localhost` is the container itself — use the LAN address,
-never `localhost`.
+`CASAOS_API_URL` has no default and must be set explicitly. A hardcoded
+fallback would both disclose one operator's LAN topology in the repository and
+risk sending the CasaOS password to whichever device later held that
+DHCP-assigned address. From inside the API container, `localhost` is the
+container itself — use the LAN address, never `localhost`.
 
-> **Heads-up:** the default URL is plain HTTP to a non-loopback host, which the
-> transport policy below rejects unless you set `CASAOS_ALLOW_INSECURE_HTTP=true`
-> (trusted LAN only — password and JWT travel in cleartext) or point the URL at
-> an `https:` address. Without one of those, CasaOS stays disconnected with a
-> 503 configuration error.
+> **Heads-up:** a plain-HTTP non-loopback URL is rejected by the transport
+> policy below unless you set `CASAOS_ALLOW_INSECURE_HTTP=true` (trusted LAN
+> only — password and JWT travel in cleartext) or point the URL at an `https:`
+> address. Without one of those, CasaOS stays disconnected with a 503
+> configuration error.
 
 ### Transport policy
 
