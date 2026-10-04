@@ -618,6 +618,7 @@ function ReviewDetail({ initial }: { initial: ActionProposal }) {
     }
   };
   const email = action.kind === "email.send";
+  const casaos = action.kind === "casaos.action";
   return (
     <Sheet
       title={pending ? "One last look" : action.title}
@@ -694,6 +695,18 @@ function ReviewDetail({ initial }: { initial: ActionProposal }) {
               <Text style={s.muted}>No attachments</Text>
             )}
           </>
+        ) : casaos ? (
+          <>
+            <ReviewLine label="App" value={String(d.app || "")} />
+            <ReviewLine label="Action" value={String(d.action || "")} />
+            {typeof d.note === "string" && d.note ? (
+              <ReviewLine label="Model note (unverified)" value={d.note} />
+            ) : null}
+            <Text style={s.small}>
+              This changes your CasaOS server. Approval applies only to the app and action shown
+              above — the note is the model&apos;s context, not part of the action.
+            </Text>
+          </>
         ) : (
           <>
             <ReviewLine label="Event" value={String(d.title || "")} />
@@ -763,7 +776,7 @@ function ReviewDetail({ initial }: { initial: ActionProposal }) {
             </Button>
             {/* Editing happens in place above, so the old deny-and-reopen route is kept
                 only for calendar changes, which need the full event editor. */}
-            {action.kind !== "calendar.delete" && !email && (
+            {action.kind !== "calendar.delete" && action.kind !== "casaos.action" && !email && (
               <Button icon={Edit3} disabled={busy} onPress={() => void edit()}>
                 Edit details
               </Button>

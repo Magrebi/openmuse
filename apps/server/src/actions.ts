@@ -24,8 +24,11 @@ interface Options {
     target?: CalendarEvent;
     targetVersion?: string;
   }>;
-  connected: (owner: string) => Promise<boolean>;
-  connection?: (owner: string) => Promise<{ id: string; account: string } | null>;
+  connected: (owner: string, kind?: ProposalInput["kind"]) => Promise<boolean>;
+  connection?: (
+    owner: string,
+    kind?: ProposalInput["kind"],
+  ) => Promise<{ id: string; account: string } | null>;
   now?: () => number;
 }
 export class ActionService {
@@ -42,26 +45,86 @@ export class ActionService {
     idempotencyKey?: string,
     taskId?: string,
   ): Promise<ActionProposal> {
-    const id =
-      idempotencyKey === undefined
-        ? randomUUID()
-        : createHash("sha256").update(idempotencyKey).digest("hex");
-    if (idempotencyKey !== undefined) {
-      const existing = await this.db.get<ActionProposal>(owner, "actions", id);
-      if (existing) return existing;
+    // Terminal CasaOS records are replayed only when it is safe: a resumed
+    // task re-proposing an action that already SUCCEEDED (or whose outcome is
+    // UNKNOWN and must not be re-executed) gets the recorded result back
+    // instead of a second review — otherwise every re-run would open an
+    // approval loop. Denied/expired/cancelled/failed records always produce a
+    // fresh review, so a denial can never be replayed as an approval.
+    const TERMINAL_CASAOS_STATUSES = new Set([
+      "succeeded",
+      "failed",
+      "outcome_unknown",
+      "denied",
+      "cancelled",
+      "expired",
+    ]);
+    // Statuses safe to replay for the same task: re-executing could
+    // double-apply (or already applied), so the recorded result stands.
+    const REPLAYABLE_CASAOS_STATUSES = new Set(["succeeded", "outcome_unknown"]);
+    // Generation-scoped idempotency. A terminal but non-replayable record
+    // (denied/expired/cancelled/failed) must not shadow later reviews: each such
+    // record advances the lookup to the next generation, so a repeated propose()
+    // finds the pending or replayable review instead of minting another
+    // duplicate. Generation 0 keeps the historical sha256(key) ID, so existing
+    // records are unaffected.
+    const MAX_ACTION_GENERATIONS = 50;
+    const idForGeneration = (key: string, generation: number): string =>
+      createHash("sha256")
+        .update(generation === 0 ? key : `${key}#${generation}`)
+        .digest("hex");
+    let id: string;
+    if (idempotencyKey === undefined) {
+      id = randomUUID();
+    } else {
+      let chosen: string | undefined;
+      for (let generation = 0; generation < MAX_ACTION_GENERATIONS; generation += 1) {
+        const candidate = idForGeneration(idempotencyKey, generation);
+        const existing = await this.db.get<ActionProposal>(owner, "actions", candidate);
+        if (!existing) {
+          chosen = candidate; // empty slot: create the proposal here
+          break;
+        }
+        if (existing.kind === "casaos.action" && TERMINAL_CASAOS_STATUSES.has(existing.status)) {
+          if (
+            existing.taskId !== undefined &&
+            existing.taskId === taskId &&
+            REPLAYABLE_CASAOS_STATUSES.has(existing.status)
+          ) {
+            // Replay: return a copy flagged as replayed (transient, not
+            // persisted) so the tool handler can annotate the result and the
+            // model cannot present the re-skipped action as freshly executed.
+            return { ...existing, replayed: true };
+          }
+          continue; // terminal but not replayable: try the next generation
+        }
+        // A pending/executing CasaOS review, or any non-CasaOS record, keeps
+        // today's behavior: return the existing review as-is.
+        return existing;
+      }
+      // Generation space exhausted (not expected in practice): fall back to a
+      // fresh random ID rather than overwriting an existing record.
+      id = chosen ?? randomUUID();
     }
     const parsed = proposalSchema.parse(raw);
-    const connection = await this.options.connection?.(owner);
+    const connection = await this.options.connection?.(owner, parsed.kind);
     if (this.options.connection && !connection)
-      throw new AppError("Connect Google before preparing an action", 409);
+      throw new AppError(
+        parsed.kind === "casaos.action"
+          ? "Connect CasaOS before preparing an action"
+          : "Connect Google before preparing an action",
+        409,
+      );
     const prepared = await this.options.prepare?.(owner, parsed, connection?.id);
     const input = proposalSchema.parse(prepared?.input ?? parsed);
     const title =
-      input.kind === "email.send"
-        ? `Send “${input.data.subject}”`
-        : input.kind === "calendar.delete"
-          ? `Delete ${input.data.title}`
-          : `${input.kind === "calendar.create" ? "Create" : "Update"} ${input.data.title}`;
+      input.kind === "casaos.action"
+        ? `${{ start: "Start", stop: "Stop", restart: "Restart" }[input.data.action]} ${input.data.app} on CasaOS`
+        : input.kind === "email.send"
+          ? `Send “${input.data.subject}”`
+          : input.kind === "calendar.delete"
+            ? `Delete ${input.data.title}`
+            : `${input.kind === "calendar.create" ? "Create" : "Update"} ${input.data.title}`;
     const createdAt = new Date(this.now()).toISOString();
     const proposal: ActionProposal = {
       id,
@@ -219,17 +282,24 @@ export class ActionService {
       }
       throw new AppError("This review expired. Create a fresh proposal.", 409);
     }
-    if (decision === "approve" && !(await this.options.connected(owner)))
-      throw new AppError("Google is disconnected. Reconnect before approving this action.", 409);
+    if (decision === "approve" && !(await this.options.connected(owner, proposal.kind)))
+      throw new AppError(
+        proposal.kind === "casaos.action"
+          ? "CasaOS is disconnected. Reconnect before approving this action."
+          : "Google is disconnected. Reconnect before approving this action.",
+        409,
+      );
     if (decision === "approve" && this.options.connection) {
-      const connection = await this.options.connection(owner);
+      const connection = await this.options.connection(owner, proposal.kind);
       if (
         !connection ||
         connection.id !== proposal.connectionId ||
         connection.account !== proposal.account
       )
         throw new AppError(
-          "Google account or connection changed. Prepare a new action for the connected account.",
+          proposal.kind === "casaos.action"
+            ? "CasaOS connection changed. Prepare a new action."
+            : "Google account or connection changed. Prepare a new action for the connected account.",
           409,
         );
     }

@@ -246,7 +246,7 @@ export class Store {
       `UPDATE records AS action SET data=jsonb_set(data,'{status}',$4::jsonb),updated_at=now()
        WHERE owner=$1 AND kind='actions' AND id=$2 AND data->>'status'='awaiting_review'
        AND data->>'expiresAt' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$'
-       AND (data->>'expiresAt')::timestamptz>$3::timestamptz
+       AND safe_timestamptz(data->>'expiresAt')>$3::timestamptz
        AND ($4::jsonb <> '"executing"'::jsonb OR data->>'taskId' IS NULL OR EXISTS (
          SELECT 1 FROM records task WHERE task.owner=action.owner AND task.kind='tasks'
          AND task.id=action.data->>'taskId' AND task.data->>'status' IN ('running','waiting_approval')
@@ -405,6 +405,25 @@ export async function createStore(
   // the index the taskId becomes an index condition instead of a filter.
   await database.query(
     "CREATE INDEX IF NOT EXISTS records_task_id ON records(owner,kind,(data->>'taskId'))",
+  );
+  // safe_timestamptz lets claim() compare expiresAt without ever throwing on
+  // malformed values: bad input yields NULL, and NULL > x is not true, so the
+  // row is simply skipped instead of raising a DB exception.
+  //
+  // The shape regex alone is not enough. `2026-13-45T00:00:00Z` and
+  // `2026-02-31T00:00:00Z` both match it but are not real instants, so the
+  // ::timestamptz cast still raises `22008 date/time field value out of range`
+  // and takes the whole statement — and every other claimable row with it —
+  // down. Catching in the function is what makes the guard total.
+  await database.query(
+    `CREATE OR REPLACE FUNCTION safe_timestamptz(v text) RETURNS timestamptz
+     LANGUAGE plpgsql STABLE AS $$
+     BEGIN
+       RETURN v::timestamptz;
+     EXCEPTION WHEN others THEN
+       RETURN NULL;
+     END;
+     $$`,
   );
   return new Store(database);
 }

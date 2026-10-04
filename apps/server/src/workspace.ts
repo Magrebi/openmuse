@@ -13,6 +13,8 @@ import { GoogleClient } from "../../../packages/integrations/src/google.ts";
 import { createSamplePdf } from "../../../packages/integrations/src/pdf.ts";
 import type { ActionService } from "./actions.ts";
 import { agentConfigured } from "./agent.ts";
+import { assertCasaOSAppAllowed, CasaOSClient } from "./casaos.ts";
+import { casaOSCredentialsConfigured, loadCasaOSCredentials } from "./casaos-credentials.ts";
 import type { Config } from "./config.ts";
 import type { Store } from "./db.ts";
 import { AppError } from "./errors.ts";
@@ -50,6 +52,25 @@ export class WorkspaceService {
     return this.config.mode === "sample"
       ? (await this.db.get<{ enabled: boolean }>(owner, "settings", "google"))?.enabled !== false
       : Boolean(await this.googleAuth.tokens(owner));
+  }
+  casaOS(owner: string) {
+    return new CasaOSClient({
+      baseUrl: this.config.casaosApiUrl,
+      owner,
+      loadCredentials: () => loadCasaOSCredentials(this.db, this.config, owner),
+      allowInsecureHttp: this.config.casaosAllowInsecureHttp ?? false,
+      logToModel: this.config.casaosLogToModel,
+    });
+  }
+  async casaOSConnection(owner: string) {
+    const creds = await loadCasaOSCredentials(this.db, this.config, owner);
+    return creds ? { id: creds.connectionId, account: creds.username } : null;
+  }
+  async casaOSConnected(owner: string) {
+    return (await this.casaOSConnection(owner)) !== null;
+  }
+  async casaOSConfigured(owner: string) {
+    return casaOSCredentialsConfigured(this.db, this.config, owner);
   }
   async calendars(owner: string) {
     const connection = await this.connection(owner);
@@ -280,6 +301,7 @@ export class WorkspaceService {
       events = [];
     }
     const tokens = this.config.mode === "live" ? await this.googleAuth.tokens(owner) : null;
+    const casaOSConnection = await this.casaOSConnection(owner);
     return {
       mode: this.config.mode,
       profile: {
@@ -322,6 +344,18 @@ export class WorkspaceService {
           status: "unconfigured",
           capabilities: ["Integration adapter available"],
         },
+        {
+          id: "casaos",
+          name: "CasaOS",
+          status: casaOSConnection ? "connected" : "disconnected",
+          account: casaOSConnection?.account,
+          capabilities: [
+            "App status",
+            "App logs",
+            "System status",
+            "Start / stop / restart (approved)",
+          ],
+        },
       ],
       runtime: {
         provider: this.config.agentBackend === "sample" ? "sample" : "model",
@@ -332,6 +366,16 @@ export class WorkspaceService {
     };
   }
   async prepare(owner: string, input: ProposalInput, connectionId?: string) {
+    if (input.kind === "casaos.action") {
+      // Protection list enforced at proposal time; appgrid membership is validated
+      // by the CasaOS client before proposing and again at execution time.
+      assertCasaOSAppAllowed(
+        this.config.casaosProtectedApps,
+        input.data.app,
+        this.config.casaosSelfApps,
+      );
+      return { input };
+    }
     if (input.kind === "email.send") {
       for (const id of input.data.attachmentIds) await this.files.get(owner, id);
       return { input };
@@ -356,6 +400,10 @@ export class WorkspaceService {
     connectionId?: string,
     targetVersion?: string,
   ): Promise<string> {
+    // CasaOS mutations are always real (they cannot run in the sample workspace)
+    // and always pass through the approval path; the protection list is
+    // re-checked here with the frozen, schema-validated action.
+    if (input.kind === "casaos.action") return this.executeCasaOSAction(owner, input, connectionId);
     if (this.config.mode === "sample") {
       if (input.kind === "email.send") {
         const id = randomUUID();
@@ -420,6 +468,75 @@ export class WorkspaceService {
         : await google.updateEvent(input.data.eventId, input.data, targetVersion);
     await this.db.put(owner, "events", event);
     return `Google Calendar event · ${event.id}`;
+  }
+  /**
+   * Executes an approved CasaOS action. `input` is the frozen, schema-validated
+   * record from the review: only `app` and `action` are used. The optional
+   * model note is never passed to the CasaOS API and cannot alter the action.
+   */
+  private async executeCasaOSAction(
+    owner: string,
+    input: Extract<ProposalInput, { kind: "casaos.action" }>,
+    connectionId?: string,
+  ): Promise<string> {
+    const { app, action } = input.data;
+    assertCasaOSAppAllowed(this.config.casaosProtectedApps, app, this.config.casaosSelfApps);
+    const creds = await loadCasaOSCredentials(this.db, this.config, owner);
+    if (!creds)
+      throw new AppError("CasaOS is disconnected. Reconnect before approving this action.", 409);
+    // connectionId is mandatory for CasaOS actions: without it we cannot prove
+    // the review belongs to the currently connected account.
+    if (!connectionId || creds.connectionId !== connectionId)
+      throw new AppError("CasaOS connection changed. Prepare a new action.", 409);
+    // Freeze the approved credential for the mutation below. The CasaOSClient
+    // otherwise reloads credentials live per call: a credential saved between
+    // this check and the PUT would make the mutation go out under the NEW
+    // credential while the review was bound to the old one (TOCTOU). The
+    // frozen client guarantees the review-bound connection performs the
+    // mutation (and the follow-up poll reads).
+    const approvedCreds = creds;
+    const client = new CasaOSClient({
+      baseUrl: this.config.casaosApiUrl,
+      owner,
+      loadCredentials: async () => approvedCreds,
+      allowInsecureHttp: this.config.casaosAllowInsecureHttp ?? false,
+    });
+    // Throws OutcomeUnknownError when the result is ambiguous (timeout / 5xx /
+    // ambiguous transport failure): no retries, the caller records
+    // outcome_unknown and the agent asks the user to check the app's status
+    // instead of assuming success.
+    await client.setAppStatus(app, action);
+    // CasaOS applies the change asynchronously: wait ~3s, then poll appgrid
+    // up to 3 times (~3.5s apart) and report the actual observed status.
+    // A poll failure must never turn an applied action into a "failed" one.
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+    const verb = action === "restart" ? "Restart" : action === "start" ? "Start" : "Stop";
+    // The end state each action asks for. CasaOS applies changes
+    // asynchronously, so this is what the poll is actually waiting for.
+    const wanted = action === "stop" ? "exited" : "running";
+    try {
+      let status = "unknown";
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        // Bypass the appgrid cache: the point of polling is fresh state.
+        const entry = (await client.listApps(true)).find((candidate) => candidate.name === app);
+        if (!entry) break;
+        status = entry.status;
+        // Stop as soon as the requested state is observed. Without this the
+        // loop always burned its full ~7s even when the first poll already
+        // showed the app had settled.
+        if (status === wanted) break;
+        if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 3500));
+      }
+      // Say so plainly when the observed state contradicts what was asked for,
+      // instead of reporting a "running" app after the user approved a stop.
+      const mismatch =
+        status === wanted
+          ? ""
+          : ` (expected "${wanted}" after this change; the app may not have applied it — check it on CasaOS before retrying)`;
+      return `${verb} of "${app}" was requested on CasaOS. Current status: ${status}${mismatch}. CasaOS applies this change asynchronously.`;
+    } catch {
+      return `${verb} of "${app}" was requested on CasaOS. Current status could not be read.`;
+    }
   }
   async importAttachment(owner: string, reference: string): Promise<Artifact> {
     const connection = await this.connection(owner);

@@ -14,6 +14,11 @@ import { ActionService } from "./actions.ts";
 import { agentConfigured, makeRuntime } from "./agent.ts";
 import { createAuth } from "./auth.ts";
 import { BrowserService } from "./browser.ts";
+import {
+  casaOSCredentialsConfigured,
+  clearCasaOSCredentials,
+  saveCasaOSCredentials,
+} from "./casaos-credentials.ts";
 import { searchConversations } from "./chat-search.ts";
 import { ComputerService, type DockerRunner } from "./computer.ts";
 import { computerRoutes } from "./computer-routes.ts";
@@ -50,8 +55,10 @@ export async function createApp(
     execute: (owner, input, connectionId, targetVersion) =>
       workspace.execute(owner, input, connectionId, targetVersion),
     prepare: (owner, input, connectionId) => workspace.prepare(owner, input, connectionId),
-    connected: (owner) => workspace.connected(owner),
-    connection: (owner) => workspace.connection(owner),
+    connected: (owner, kind) =>
+      kind === "casaos.action" ? workspace.casaOSConnected(owner) : workspace.connected(owner),
+    connection: (owner, kind) =>
+      kind === "casaos.action" ? workspace.casaOSConnection(owner) : workspace.connection(owner),
   });
   // Reversible actions run through here rather than through the review gate.
   // The queue holds them for five seconds and publishes an undo window; the gate
@@ -329,6 +336,44 @@ export async function createApp(
       await db.put(c.get("owner"), "settings", { id: "google", enabled: false });
     else await google.disconnect(c.get("owner"));
     return c.json({ ok: true });
+  });
+  // CasaOS credential routes. The password is only ever used for a live login
+  // (before anything is stored) and inside the encrypted store; it does not
+  // intentionally appear in any response, log, or error message.
+  const casaOSSaveSchema = z.object({
+    username: z.string().min(1).max(256),
+    password: z.string().min(1).max(1024),
+  });
+  // Brute-force protection: 5 saves per minute per owner. The window is
+  // deleted when it lapses, not just reset, so the map does not retain one
+  // entry per owner that has ever signed in.
+  const casaOSSaveWindow = new Map<string, { window: number; attempts: number }>();
+  function checkCasaOSSaveLimit(owner: string) {
+    const now = Date.now();
+    const entry = casaOSSaveWindow.get(owner);
+    if (!entry || now - entry.window > 60_000) {
+      casaOSSaveWindow.delete(owner);
+      casaOSSaveWindow.set(owner, { window: now, attempts: 1 });
+      return;
+    }
+    entry.attempts += 1;
+    if (entry.attempts > 5)
+      throw new AppError("Too many CasaOS connection attempts. Try again in a minute.", 429);
+  }
+  app.get("/api/casaos/credentials", async (c) => {
+    const owner = c.get("owner");
+    return c.json({ configured: await casaOSCredentialsConfigured(db, config, owner) });
+  });
+  app.post("/api/casaos/credentials", async (c) => {
+    const owner = c.get("owner");
+    checkCasaOSSaveLimit(owner);
+    const body = casaOSSaveSchema.parse(await c.req.json());
+    await saveCasaOSCredentials(db, config, owner, body.username.trim(), body.password);
+    return c.json({ configured: true }, 201);
+  });
+  app.delete("/api/casaos/credentials", async (c) => {
+    await clearCasaOSCredentials(db, c.get("owner"));
+    return c.json({ configured: false });
   });
   app.post("/api/browsers", async (c) => {
     const body = z.object({ url: z.url().max(4096) }).parse(await c.req.json());

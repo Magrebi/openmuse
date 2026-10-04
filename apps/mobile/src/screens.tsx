@@ -16,6 +16,7 @@ import {
   Mail,
   Plus,
   Search,
+  Server,
   ShieldCheck,
   Sparkles,
   Upload,
@@ -48,6 +49,7 @@ import {
   dateLabel,
   Empty,
   ErrorNotice,
+  Field,
   IconButton,
   LinkRow,
   Mascot,
@@ -1211,6 +1213,7 @@ export function ConnectionsScreen({ query = "" }: { query?: string }) {
   }
   const google = w.connections.find((c) => c.id === "google");
   const connected = google?.status === "connected" || google?.status === "sample";
+  const casaos = w.connections.find((c) => c.id === "casaos");
   const rows = [
     { id: "gmail", name: "Gmail", icon: Mail, color: "#EA5B4D", connected, group: "google" },
     {
@@ -1228,6 +1231,14 @@ export function ConnectionsScreen({ query = "" }: { query?: string }) {
       color: "#1987CF",
       connected: w.connections.some((c) => c.id === "browser" && c.status === "connected"),
       group: "browser",
+    },
+    {
+      id: "casaos",
+      name: "CasaOS",
+      icon: Server,
+      color: "#2A9D8F",
+      connected: casaos?.status === "connected",
+      group: "casaos",
     },
     {
       id: "openbot",
@@ -1308,8 +1319,20 @@ export function ConnectionsScreen({ query = "" }: { query?: string }) {
       {!rows.length && <Text style={s.muted}>No matching connectors.</Text>}
       {selected && (
         <Sheet
-          title={selected === "google" ? "Google connections" : "OpenBot"}
-          subtitle={selected === "google" ? google?.account : "A computer for your agent"}
+          title={
+            selected === "google"
+              ? "Google connections"
+              : selected === "casaos"
+                ? "CasaOS"
+                : "OpenBot"
+          }
+          subtitle={
+            selected === "google"
+              ? google?.account
+              : selected === "casaos"
+                ? "Your home server"
+                : "A computer for your agent"
+          }
           onClose={() => setSelected(undefined)}
         >
           {selected === "google" ? (
@@ -1361,6 +1384,8 @@ export function ConnectionsScreen({ query = "" }: { query?: string }) {
                 Refresh connections
               </Button>
             </View>
+          ) : selected === "casaos" ? (
+            <CasaOSDetail />
           ) : (
             <View style={{ gap: 14 }}>
               <Text style={s.text}>
@@ -1374,6 +1399,99 @@ export function ConnectionsScreen({ query = "" }: { query?: string }) {
             </View>
           )}
         </Sheet>
+      )}
+    </View>
+  );
+}
+/** CasaOS credential form: the user enters their CasaOS username/password, which is
+ * stored encrypted on the API. Start/stop/restart always need a review approval. */
+function CasaOSDetail() {
+  const { workspace: w, api, refresh, notify } = useWorkspace();
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const casaos = w.connections.find((c) => c.id === "casaos");
+  const connected = casaos?.status === "connected";
+  async function save() {
+    setBusy(true);
+    setError("");
+    try {
+      await api.request("/api/casaos/credentials", {
+        username: username.trim(),
+        password,
+      });
+      setPassword("");
+      await refresh();
+      notify("CasaOS connected.");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function disconnect() {
+    setBusy(true);
+    setError("");
+    try {
+      await api.request("/api/casaos/credentials", undefined, "DELETE");
+      await refresh();
+      notify("CasaOS disconnected.");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <View style={{ gap: 18 }}>
+      <Text style={s.muted}>
+        Let your agent check app status, read logs and system load on your CasaOS server. Starting,
+        stopping or restarting an app always asks for your approval first — the agent can never act
+        on its own.
+      </Text>
+      <ErrorNotice error={error} />
+      {connected ? (
+        <>
+          <Text style={s.text}>Connected{casaos?.account ? ` as ${casaos.account}` : ""}.</Text>
+          <Button busy={busy} danger onPress={() => void disconnect()}>
+            Disconnect CasaOS
+          </Button>
+        </>
+      ) : (
+        <>
+          <Field
+            label="CasaOS username"
+            value={username}
+            onChangeText={setUsername}
+            autoCapitalize="none"
+            autoCorrect={false}
+            placeholder="Your CasaOS username"
+          />
+          <Field
+            label="CasaOS password"
+            value={password}
+            onChangeText={setPassword}
+            secureTextEntry
+            autoCapitalize="none"
+            autoCorrect={false}
+            placeholder="Your CasaOS password"
+          />
+          <Text style={s.small}>
+            Your password travels from this device to the OpenMuse API and is stored encrypted
+            there. Over a plain http:// address it travels unencrypted on your local network —
+            prefer the Tailscale HTTPS address when you are away from home.
+          </Text>
+          <Button
+            busy={busy}
+            primary
+            icon={Link2}
+            disabled={!username.trim() || !password}
+            onPress={() => void save()}
+          >
+            Connect CasaOS
+          </Button>
+        </>
       )}
     </View>
   );

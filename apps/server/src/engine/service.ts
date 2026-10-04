@@ -25,6 +25,7 @@ import type {
 } from "../../../../packages/domain/src/index.ts";
 import type { ActionService } from "../actions.ts";
 import type { BrowserService } from "../browser.ts";
+import { assertCasaOSAppAllowed } from "../casaos.ts";
 import { ComputerService } from "../computer.ts";
 import type { Config } from "../config.ts";
 import type { Store } from "../db.ts";
@@ -821,6 +822,45 @@ export class AgentService {
         proposal.title,
         `Review prepared for ${proposal.account ?? "the connected account"}`,
       );
+    return proposal;
+  }
+  /**
+   * CasaOS variant of prepare(): the action is reviewed in the OpenMuse UI and
+   * only executes after the user approves it there. The protection list is
+   * checked before proposing; the proposal idempotency key covers the frozen
+   * {app, action} pair. CasaOS actions are not bound to a task's Google
+   * connection state.
+   */
+  async prepareCasaOSAction(
+    owner: string,
+    task: AgentTask,
+    data: { app: string; action: "start" | "stop" | "restart"; note?: string },
+    key: string,
+    context: TaskContext,
+  ) {
+    await context.guard();
+    assertCasaOSAppAllowed(this.config.casaosProtectedApps, data.app, this.config.casaosSelfApps);
+    const proposal = await this.actions.propose(
+      owner,
+      { kind: "casaos.action", data },
+      `${task.id}:${key}`,
+      task.id,
+    );
+    if (proposal.status === "succeeded") return proposal;
+    if (proposal.status !== "awaiting_review" && proposal.status !== "executing")
+      throw new AppError(
+        `Reviewed action ${proposal.status}: ${proposal.error ?? "No further action was taken"}`,
+        409,
+      );
+    try {
+      await context.checkpoint({ actionId: proposal.id });
+    } catch (error) {
+      if (proposal.status === "awaiting_review")
+        await this.actions.decide(owner, proposal.id, proposal.hash, "deny");
+      throw error;
+    }
+    if (proposal.status === "awaiting_review")
+      await context.event("approval", proposal.title, "Review prepared for CasaOS");
     return proposal;
   }
   private async execute(
