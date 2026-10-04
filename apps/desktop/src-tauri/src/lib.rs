@@ -406,7 +406,7 @@ fn set_tray(app: &AppHandle, tone: &str, state: &str, spark: Option<&[f32]>) {
     // the status page can never disagree about which state this is.
     let _ = tray.set_tooltip(Some(format!("OpenMuse — {} ({})", state, tone)));
     if let Some(bars) = spark {
-        let _ = tray.set_icon(spark_icon(bars));
+        let _ = tray.set_icon(Some(spark_icon(bars)));
     }
 }
 
