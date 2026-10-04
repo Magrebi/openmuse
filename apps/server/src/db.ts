@@ -2,6 +2,7 @@ import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import { PGlite } from "@electric-sql/pglite";
 import pg from "pg";
+import { AppError } from "./errors.ts";
 import { backgroundFailure } from "./log.ts";
 
 type Row = { data: Record<string, unknown> };
@@ -70,6 +71,65 @@ export class Store {
         ORDER_SQL[order]
       }`,
       [owner, kind, field, value],
+    );
+    return result.rows.map((row) => row.data as T);
+  }
+  /**
+   * The names of the indexes defined on `records`.
+   *
+   * Exists so a test can assert that an index is actually registered rather than
+   * inferring it from a query plan. The column is aliased to `data` because that
+   * is the key this store's Database adapter exposes on every read.
+   */
+  async indexNames(): Promise<string[]> {
+    const result = await this.db.query(
+      "SELECT indexname AS data FROM pg_indexes WHERE tablename='records'",
+    );
+    return result.rows.map((row) => String(row.data));
+  }
+  /**
+   * Calendar events for one calendar that overlap a time window, filtered in SQL.
+   *
+   * The JavaScript version read every event the owner had for the calendar and
+   * compared `Date.parse(start)`/`Date.parse(end)` in memory. That is wrong twice
+   * over: it scales with the owner's whole event history rather than with the
+   * window, and `Date.parse` is lenient where Postgres is strict, so a malformed
+   * timestamp silently became `NaN` and the comparison quietly excluded the row
+   * instead of failing visibly.
+   *
+   * Overlap is the same rule as before: the event starts before `to` and ends
+   * after `from`. Both bounds are optional, and a half-open window is a single
+   * condition rather than a separate query shape.
+   *
+   * `start` and `end` are fixed column names, not parameters, so nothing
+   * caller-supplied reaches the SQL text; only the two bounds are bound.
+   *
+   * The ISO-8601 shape test runs BEFORE each cast, so one malformed row is
+   * skipped by the predicate instead of raising and aborting the whole statement
+   * — the same hazard the claim path guards against.
+   */
+  async listEventsInRange<T = Record<string, unknown>>(
+    owner: string,
+    kind: string,
+    field: string,
+    value: string,
+    window: { from?: string; to?: string } = {},
+  ): Promise<T[]> {
+    const iso = "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}";
+    // An unparseable window would make every comparison false and silently
+    // return nothing, so reject it here where the caller can see why.
+    const isBound = (bound: string | undefined) =>
+      bound === undefined || new RegExp(iso).test(bound);
+    if (!isBound(window.from) || !isBound(window.to))
+      throw new AppError("timeMin and timeMax must be ISO-8601 timestamps.", 400);
+    const result = await this.db.query(
+      `SELECT data FROM records
+       WHERE owner=$1 AND kind=$2 AND data->>$3=$4
+         AND data->>'start' ~ '${iso}' AND data->>'end' ~ '${iso}'
+         AND ($5::timestamptz IS NULL OR (data->>'end')::timestamptz > $5::timestamptz)
+         AND ($6::timestamptz IS NULL OR (data->>'start')::timestamptz < $6::timestamptz)
+       ORDER BY (data->>'start')::timestamptz ASC,id ASC`,
+      [owner, kind, field, value, window.from ?? null, window.to ?? null],
     );
     return result.rows.map((row) => row.data as T);
   }
@@ -257,6 +317,15 @@ export async function createStore(
   }
   await database.query(
     "CREATE TABLE IF NOT EXISTS records(owner text NOT NULL,kind text NOT NULL,id text NOT NULL,data jsonb NOT NULL,updated_at timestamptz NOT NULL DEFAULT now(),PRIMARY KEY(owner,kind,id))",
+  );
+  // The task worker ticks once a second and scans "tasks" (engine/worker.ts),
+  // and maintain() does the same every 60s (engine/service.ts). scan() filters on
+  // `kind` alone, so without this each tick reads and materialises every row of
+  // every kind for every owner: the cost grows with total lifetime records rather
+  // than with the number of due tasks. (kind, updated_at) serves the equality
+  // filter and the existing ORDER BY, so it also removes the sort.
+  await database.query(
+    "CREATE INDEX IF NOT EXISTS records_kind_updated ON records(kind, updated_at)",
   );
   // Task detail reads are filtered by taskId. Without this the planner can only
   // reach them through the primary key and then discard every row of that kind,
