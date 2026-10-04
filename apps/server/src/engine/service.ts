@@ -34,6 +34,7 @@ import { backgroundFailure } from "../log.ts";
 import type { WorkspaceService } from "../workspace.ts";
 import { analyzeSpending } from "./finance.ts";
 import { executeModelTask } from "./model.ts";
+import { correlate, isScheduling } from "./semantics.ts";
 import { LostLeaseError, type TaskContext, TaskWorker } from "./worker.ts";
 
 const hash = (text: string) => createHash("sha256").update(text).digest("hex");
@@ -548,12 +549,40 @@ export class AgentService {
           { status: "new" },
           { status: "dismissed" },
         );
+    // Cross-source suggestions come first. A pairing the scanner found is more
+    // specific than anything the single-source heuristics below can produce —
+    // it names the email and the event it conflicts with — so it is offered
+    // before them, and the single-source rules only see mail the scanner had
+    // nothing to say about.
+    const correlated = correlate(w.mail, w.events, Date.now());
+    const seenMessages = new Set<string>();
+    for (const candidate of correlated) {
+      const messageId = candidate.key.split(":")[1];
+      if (messageId) seenMessages.add(messageId);
+      const id = hash(candidate.key);
+      const source = w.mail.find((m) => m.id === messageId);
+      await this.db.insertIfAbsent(owner, "ideas", {
+        id,
+        title: candidate.title,
+        reason: candidate.reason,
+        evidence: source ? [this.mailEvidence(source)] : [],
+        prompt: candidate.prompt,
+        kind: "agent",
+        // Both ids travel so an accepted idea can be traced to its sources,
+        // and so a later scan can tell whether the pairing is still current.
+        input: { messageId, key: candidate.key },
+        status: "new",
+        createdAt: date(),
+      } satisfies Idea);
+    }
     for (const mail of w.mail
       .filter(
         (m) =>
           !obsolete("document", m.id) &&
-          m.attachments.length &&
-          /form|permission|complete|fill|sign/i.test(`${m.subject} ${m.body}`),
+          // A message the scanner already paired with something is not also
+          // offered again as a standalone "here is a document" idea.
+          !seenMessages.has(m.id) &&
+          m.attachments.length,
       )
       .slice(0, 5)) {
       const id = hash(`document:${mail.id}:${mail.body}`);
@@ -574,7 +603,10 @@ export class AgentService {
       .filter(
         (m) =>
           !obsolete("agent", m.id) &&
-          /coffee|meet|available|schedule/i.test(`${m.subject} ${m.body}`),
+          // A message already paired with a calendar event is a richer idea
+          // than a standalone "reply to this" would be.
+          !seenMessages.has(m.id) &&
+          isScheduling(`${m.subject} ${m.body}`),
       )
       .slice(0, 5)) {
       await this.db.insertIfAbsent(owner, "ideas", {
