@@ -8,11 +8,31 @@ function decodeKey(key: string): Buffer {
   return bytes;
 }
 
+/**
+ * The additional authenticated data every credential envelope is bound to.
+ *
+ * A constant, and deliberately so: it is the one value that cannot change
+ * without invalidating every credential already encrypted on disk. Per-slot
+ * binding (`owner` + `connectionId` + `generation`) is the correct end state
+ * and is deferred — see REVIEW.md (L6) and the substitution test in
+ * `tests/vault.test.ts`, which pins the current behaviour so the constant
+ * cannot be edited without that being noticed.
+ *
+ * Accepted as an explicit parameter only so the eventual migration is a
+ * mechanical change at the call sites rather than a rewrite of the envelope
+ * format. Every caller today omits it and gets exactly these bytes.
+ */
+const DEFAULT_AAD = Buffer.from("openmuse:credential:v1");
+
 /** Versioned AES-256-GCM envelope: version.nonce.tag.ciphertext. */
-export function encryptSecret(plaintext: string, key: string): string {
+export function encryptSecret(
+  plaintext: string,
+  key: string,
+  aad: Buffer = DEFAULT_AAD,
+): string {
   const nonce = randomBytes(12);
   const cipher = createCipheriv("aes-256-gcm", decodeKey(key), nonce);
-  cipher.setAAD(Buffer.from("openmuse:credential:v1"));
+  cipher.setAAD(aad);
   const ciphertext = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
   return [
     "v1",
@@ -22,7 +42,11 @@ export function encryptSecret(plaintext: string, key: string): string {
   ].join(".");
 }
 
-export function decryptSecret(encrypted: string, key: string): string {
+export function decryptSecret(
+  encrypted: string,
+  key: string,
+  aad: Buffer = DEFAULT_AAD,
+): string {
   const keyBytes = decodeKey(key);
   const [version, nonceString, tagString, ciphertextString, extra] = encrypted.split(".");
   if (
@@ -47,7 +71,7 @@ export function decryptSecret(encrypted: string, key: string): string {
   }
   try {
     const decipher = createDecipheriv("aes-256-gcm", keyBytes, nonce);
-    decipher.setAAD(Buffer.from("openmuse:credential:v1"));
+    decipher.setAAD(aad);
     decipher.setAuthTag(tag);
     return Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString("utf8");
   } catch {
