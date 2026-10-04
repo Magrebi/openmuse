@@ -264,9 +264,11 @@ test("committing something unknown is refused", async () => {
   await assert.rejects(h.queue.commit("never-queued"), /no longer available/);
 });
 
-test("closing the queue abandons pending actions rather than starting them", async () => {
+test("closing abandons pending actions rather than starting them", async () => {
   // A process that is going away must not begin a new external write on its way
-  // out; the action is simply never taken.
+  // out; the action is simply never taken. This is the shape the server's
+  // shutdown uses, so it is the property that keeps a restart from firing
+  // something nobody approved.
   const h = harness();
   const action = spy();
   queueOn(h, "a", action);
@@ -275,6 +277,16 @@ test("closing the queue abandons pending actions rather than starting them", asy
   assert.equal(action.calls.commit, 0);
   assert.equal(h.queue.size, 0);
   assert.equal(h.liveTimers, 0);
+});
+
+test("closing does not reject an undo that arrives afterwards", async () => {
+  // The shutdown closes the queue while a client may still be mid-request. That
+  // undo must fail cleanly rather than reject with something the error handler
+  // turns into a crash report.
+  const h = harness();
+  queueOn(h, "a", spy());
+  await h.queue.close();
+  await assert.rejects(h.queue.undo("a"), /no longer available/);
 });
 
 test("closing can commit pending actions when a caller asks it to", async () => {

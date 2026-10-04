@@ -48,6 +48,15 @@ const terminal = new Set(["succeeded", "failed", "cancelled"]);
  * when it is blocked on a person.
  */
 const WORKING_STATUSES = new Set(["queued", "running"]);
+
+/**
+ * How many rows of each append-only log to keep.
+ *
+ * Far more than any screen shows, because the oldest entries are still evidence
+ * of what the agent did — but bounded, because keeping all of them forever makes
+ * the table grow for as long as the workspace is used.
+ */
+const HISTORY_ROWS = 5_000;
 export class AgentService {
   readonly worker: TaskWorker;
   private maintenance?: ReturnType<typeof setInterval>;
@@ -119,8 +128,33 @@ export class AgentService {
             );
           });
       }
+      await this.trimHistory();
     } finally {
       this.refreshing = false;
+    }
+  }
+  /**
+   * Keep the append-only logs proportional to recent history.
+   *
+   * Run events and the activity timeline gain a row for every step and every
+   * decision the agent takes, and nothing ever reads the oldest ones — a task's
+   * detail query is already indexed, and the workspace only renders recent
+   * entries. Without this they grow for as long as the workspace is used, which
+   * makes the table and every scan over it larger for no benefit.
+   *
+   * Failure is swallowed: housekeeping that cannot run must not stop the
+   * recovery passes above it from running.
+   */
+  private async trimHistory(): Promise<void> {
+    for (const kind of ["run-events", "activity"]) {
+      for (const owner of await this.db.owners()) {
+        try {
+          await this.db.trimOlderThan(owner, kind, HISTORY_ROWS);
+        } catch (error) {
+          backgroundFailure(`trim ${kind}`, error);
+          return;
+        }
+      }
     }
   }
   async ensure(owner: string) {

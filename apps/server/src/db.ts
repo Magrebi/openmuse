@@ -5,9 +5,9 @@ import pg from "pg";
 import { AppError } from "./errors.ts";
 import { backgroundFailure } from "./log.ts";
 
-type Row = { data: Record<string, unknown> };
+type Row = { data: Record<string, unknown>; [column: string]: unknown };
 interface Database {
-  query: (sql: string, params?: unknown[]) => Promise<{ rows: Row[] }>;
+  query: (sql: string, params?: unknown[]) => Promise<{ rows: Row[]; rowCount?: number | null }>;
   close: () => Promise<void>;
 }
 
@@ -267,6 +267,68 @@ export class Store {
       "DELETE FROM records WHERE owner=$1 AND kind=$2 AND data->>'expiresAt' ~ '^[0-9]+$' AND (data->>'expiresAt')::bigint<=$3",
       [owner, kind, now],
     );
+  }
+  /**
+   * List a kind, newest first, capped.
+   *
+   * `ORDER BY updated_at DESC` is already served by `records_kind_updated`, so
+   * adding `LIMIT` costs nothing extra and lets the caller ask for "the recent
+   * ones" without pulling the entire history into memory. The kinds that grow
+   * without bound — activity and run events — are exactly the ones that must
+   * never be read whole.
+   */
+  async listRecent<T = Record<string, unknown>>(
+    owner: string,
+    kind: string,
+    limit: number,
+  ): Promise<T[]> {
+    // Bounded by the caller but clamped here too, so a bad limit cannot become a
+    // full table scan wearing a different name.
+    const capped = Math.max(1, Math.min(1000, Math.floor(limit)));
+    const result = await this.db.query(
+      "SELECT data FROM records WHERE owner=$1 AND kind=$2 ORDER BY updated_at DESC,id LIMIT $3",
+      [owner, kind, capped],
+    );
+    return result.rows.map((row) => row.data as T);
+  }
+  /**
+   * Every owner that has records.
+   *
+   * Used by housekeeping that has to run per owner — trimming the append-only logs
+   * — without being handed a list from a caller that might forget somebody.
+   * Read from the indexed leading column, and deduplicated because a table scan
+   * would otherwise repeat an owner once per row.
+   */
+  async owners(): Promise<string[]> {
+    const result = await this.db.query("SELECT DISTINCT owner FROM records ORDER BY owner");
+    return result.rows.map((row) => String(row.owner));
+  }
+  /**
+   * Delete all but the newest `keep` rows of one kind.
+   *
+   * Kinds like activity and run events are append-only and are never read whole,
+   * so nothing ever needs the oldest rows again. Trimming them keeps the table
+   * — and every index scan over it — proportional to recent history rather than
+   * to how long the workspace has been in use.
+   */
+  async trimOlderThan(owner: string, kind: string, keep: number): Promise<number> {
+    const bounded = Math.max(1, Math.min(10_000, Math.floor(keep)));
+    // Counted with a separate statement rather than from the DELETE's own
+    // rowCount: PGlite does not populate it, so returning it would report zero
+    // deletions on the very database OpenMuse runs on.
+    const before = await this.db.query(
+      "SELECT count(*)::int AS total FROM records WHERE owner=$1 AND kind=$2",
+      [owner, kind],
+    );
+    const total = Number(before.rows[0]?.total ?? 0);
+    if (total <= bounded) return 0;
+    await this.db.query(
+      `DELETE FROM records WHERE owner=$1 AND kind=$2 AND id NOT IN (
+         SELECT id FROM records WHERE owner=$1 AND kind=$2 ORDER BY updated_at DESC,id LIMIT $3
+       )`,
+      [owner, kind, bounded],
+    );
+    return total - bounded;
   }
   async recoverInterruptedActions(): Promise<void> {
     await this.db.query(

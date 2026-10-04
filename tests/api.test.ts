@@ -261,3 +261,101 @@ test("guided document delegation streams a rich tool result bound to its saved t
   assert.equal(task?.kind, "document");
   assert.equal(task?.input.messageId, "mail-fieldtrip");
 });
+
+/** Propose an email through the API, the way the agent would. */
+async function proposeEmail(over: Record<string, unknown> = {}): Promise<ActionProposal> {
+  const response = await app.request("/api/actions", {
+    method: "POST",
+    headers: headers(),
+    body: JSON.stringify({
+      kind: "email.send",
+      data: {
+        to: ["sam@example.com"],
+        cc: [],
+        bcc: [],
+        subject: "Visit",
+        body: "See attached.",
+        attachmentIds: [],
+        ...over,
+      },
+    }),
+  });
+  assert.equal(response.status, 201);
+  return (await response.json()) as ActionProposal;
+}
+
+test("an email draft can be amended in place through the API", async () => {
+  const proposal = await proposeEmail();
+  const response = await app.request(`/api/actions/${proposal.id}/amend`, {
+    method: "POST",
+    headers: headers(),
+    body: JSON.stringify({ hash: proposal.hash, data: { subject: "Visit on Saturday" } }),
+  });
+  assert.equal(response.status, 200);
+  const amended = (await response.json()) as ActionProposal;
+  assert.equal(amended.data.subject, "Visit on Saturday");
+  // The new hash is what makes this a fresh thing to review rather than an edit
+  // that sneaks past the thing that was reviewed.
+  assert.notEqual(amended.hash, proposal.hash);
+  assert.equal(amended.status, "awaiting_review");
+});
+
+test("amending requires a session", async () => {
+  // The amend route writes to a proposal that leads to an outbound email, so it
+  // must sit behind the same authentication as the decision it precedes.
+  const proposal = await proposeEmail();
+  const response = await app.request(`/api/actions/${proposal.id}/amend`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ hash: proposal.hash, data: { subject: "no" } }),
+  });
+  assert.equal(response.status, 401);
+});
+
+test("amending with a stale hash is refused", async () => {
+  const proposal = await proposeEmail();
+  const first = await app.request(`/api/actions/${proposal.id}/amend`, {
+    method: "POST",
+    headers: headers(),
+    body: JSON.stringify({ hash: proposal.hash, data: { subject: "first" } }),
+  });
+  assert.equal(first.status, 200);
+  const second = await app.request(`/api/actions/${proposal.id}/amend`, {
+    method: "POST",
+    headers: headers(),
+    body: JSON.stringify({ hash: proposal.hash, data: { subject: "second" } }),
+  });
+  assert.equal(second.status, 409);
+});
+
+test("an amendment cannot attach a file the owner does not have", async () => {
+  // The attachment check `propose` performs has to happen here too, or editing a
+  // review is a way to attach another owner's document to an outbound email.
+  const proposal = await proposeEmail();
+  await db.put("someone-else", "files", {
+    id: "not-mine",
+    name: "salary.pdf",
+    mimeType: "application/pdf",
+  });
+  const response = await app.request(`/api/actions/${proposal.id}/amend`, {
+    method: "POST",
+    headers: headers(),
+    body: JSON.stringify({ hash: proposal.hash, data: { attachmentIds: ["not-mine"] } }),
+  });
+  assert.equal(response.status, 404);
+  const saved = await db.get<ActionProposal>("local-user", "actions", proposal.id);
+  assert.deepEqual(saved?.data.attachmentIds, [], "the rejected attachment must not be stored");
+});
+
+test("an amendment cannot change the kind of action", async () => {
+  const proposal = await proposeEmail();
+  const response = await app.request(`/api/actions/${proposal.id}/amend`, {
+    method: "POST",
+    headers: headers(),
+    body: JSON.stringify({
+      hash: proposal.hash,
+      data: { kind: "calendar.delete", eventId: "e1", calendarId: "primary", title: "x" },
+    }),
+  });
+  assert.equal(response.status, 409);
+});

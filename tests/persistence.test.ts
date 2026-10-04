@@ -557,3 +557,108 @@ test("listEventsInRange returns only events overlapping the window, in start ord
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("listRecent returns a prefix of the full list, capped", async () => {
+  // The leak this pins: activity and run events are append-only, and reading
+  // them whole made an ordinary refresh cost more the longer the workspace had
+  // been used. The client renders the recent ones and nothing else.
+  //
+  // The assertion is "a prefix of the full read" rather than "the newest is
+  // first", because several rows written in the same millisecond share an
+  // `updated_at` and their relative order is decided by the id tiebreak. What
+  // matters is that the capped read is exactly the head of the ordered list and
+  // that the head is bounded.
+  const root = await mkdtemp(join(tmpdir(), "openmuse-db-recent-"));
+  try {
+    const db = await createStore({ dataDir: join(root, "pg") });
+    for (let i = 0; i < 25; i++) {
+      await db.put("owner", "activity", { id: `a${i}`, n: i });
+      // Distinct timestamps so "newest" is well defined for the assertion below.
+      await new Promise((r) => setTimeout(r, 2));
+    }
+    const all = await db.list<{ n: number }>("owner", "activity");
+    const recent = await db.listRecent<{ n: number }>("owner", "activity", 10);
+    assert.equal(all.length, 25);
+    assert.equal(recent.length, 10, "the read must be capped");
+    assert.deepEqual(
+      recent.map((r) => r.n),
+      all.slice(0, 10).map((r) => r.n),
+      "the capped read must be the head of the ordered list",
+    );
+    await db.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("listRecent clamps a limit that would be a full table scan", async () => {
+  // A caller asking for "everything" must not be able to make this the very scan
+  // it was added to avoid.
+  const root = await mkdtemp(join(tmpdir(), "openmuse-db-clamp-"));
+  try {
+    const db = await createStore({ dataDir: join(root, "pg") });
+    for (let i = 0; i < 5; i++) await db.put("owner", "activity", { id: `a${i}` });
+    assert.equal((await db.listRecent("owner", "activity", 0)).length, 1);
+    assert.equal((await db.listRecent("owner", "activity", -3)).length, 1);
+    assert.equal((await db.listRecent("owner", "activity", 10_000)).length, 5);
+    await db.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("trimOlderThan keeps the newest rows and deletes the rest", async () => {
+  const root = await mkdtemp(join(tmpdir(), "openmuse-db-trim-"));
+  try {
+    const db = await createStore({ dataDir: join(root, "pg") });
+    for (let i = 0; i < 20; i++) {
+      await db.put("owner", "run-events", { id: `e${i}`, n: i });
+      // Distinct timestamps, so "the newest survive" is well defined.
+      await new Promise((r) => setTimeout(r, 2));
+    }
+    const removed = await db.trimOlderThan("owner", "run-events", 5);
+    assert.equal(removed, 15);
+    const kept = await db.list<{ n: number }>("owner", "run-events");
+    assert.equal(kept.length, 5);
+    assert.equal(
+      Math.max(...kept.map((row) => row.n)),
+      19,
+      "the newest rows must be the ones that survive",
+    );
+    await db.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("trimming one owner's history leaves another owner's alone", async () => {
+  // Housekeeping that reaches across owners would delete somebody's evidence
+  // because somebody else generated a lot of activity.
+  const root = await mkdtemp(join(tmpdir(), "openmuse-db-trim-owner-"));
+  try {
+    const db = await createStore({ dataDir: join(root, "pg") });
+    for (let i = 0; i < 10; i++) {
+      await db.put("noisy", "activity", { id: `n${i}` });
+      await db.put("quiet", "activity", { id: `q${i}` });
+    }
+    await db.trimOlderThan("noisy", "activity", 2);
+    assert.equal((await db.list("noisy", "activity")).length, 2);
+    assert.equal((await db.list("quiet", "activity")).length, 10);
+    await db.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("owners lists each owner once however many records they have", async () => {
+  const root = await mkdtemp(join(tmpdir(), "openmuse-db-owners-"));
+  try {
+    const db = await createStore({ dataDir: join(root, "pg") });
+    for (let i = 0; i < 4; i++) await db.put("alice", "activity", { id: `a${i}` });
+    await db.put("bob", "activity", { id: "b0" });
+    assert.deepEqual(await db.owners(), ["alice", "bob"]);
+    await db.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

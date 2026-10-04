@@ -290,8 +290,12 @@ export class WorkspaceService {
       events: events.sort((a, b) => a.start.localeCompare(b.start)),
       files: await this.files.list(owner),
       browsers: await this.db.list<BrowserSession>(owner, "browsers"),
-      actions: await this.db.list<ActionProposal>(owner, "actions"),
-      activity: await this.db.list<ActivityEntry>(owner, "activity"),
+      // Both of these are append-only and grow with every action the agent has
+      // ever taken. They were read whole, which made an ordinary workspace
+      // refresh cost more the longer the workspace had been in use — and the
+      // client only ever renders the recent ones.
+      actions: await this.db.listRecent<ActionProposal>(owner, "actions", 200),
+      activity: await this.db.listRecent<ActivityEntry>(owner, "activity", 200),
       connections: [
         {
           id: "google",

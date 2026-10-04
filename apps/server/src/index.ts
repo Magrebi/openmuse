@@ -10,7 +10,7 @@ const db = await createStore({
   databaseUrl: config.databaseUrl,
 });
 await db.recoverInterruptedActions();
-const { app, auth, agent, browser } = await createApp(db, config);
+const { app, auth, agent, browser, undo } = await createApp(db, config);
 if (config.taskWorkerEnabled) agent.start();
 const server = serve({ fetch: app.fetch, port: config.port, hostname: config.host }, () =>
   console.log(`OpenMuse ${config.mode} API ready at ${config.publicUrl}`),
@@ -21,10 +21,15 @@ const mirror = attachMirror(server as unknown as Parameters<typeof attachMirror>
   browser,
   auth,
 });
+// The queue is closed without `commitPending`, so a shutdown never begins a new
+// external write on its way out: anything still inside its undo window is simply
+// never taken. Its timers are already unref'd, so this is about the actions
+// rather than about letting the process exit.
 const shutdown = () => {
   server.close(() => {
-    void agent
-      .stop()
+    void undo
+      .close()
+      .then(() => agent.stop())
       .then(() => mirror.close())
       .then(() => db.close())
       .then(() => process.exit(0));
