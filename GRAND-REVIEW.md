@@ -92,8 +92,8 @@ test that fails without the fix.
 | 2 | `diff-editor.tsx` | Animated rows were keyed by array index, so inserting a line made every row below it animate the wrong text into the wrong place. | `keyRows` keys on content plus an occurrence counter, so a row is identified by what it says. |
 | 3 | `sparkline.ts` | A zero load was recorded as a sample, so an idle agent painted a bar — reporting activity that was not happening. | Idle is the absence of work and is not recorded; the now-dead `idle` branch in `summary()` was removed with it. |
 | 4 | `control.ts` | Bar heights were clamped to the box height rather than its last addressable row, so a floor bar scaled to **1.1** and the tray was asked to draw taller than its icon. | Clamp to `height - 1`, with saturating arithmetic. |
-| 5 | `lib.rs` (`spark_icon`) | Slot width is 1 at the constants actually used, so the ordinary `- 2` gap **underflowed and would have panicked on first paint**. | `saturating_sub`, with bounds proven by a standalone check (see Notes). |
-| 6 | `db.ts` (`trimOlderThan`) | The deletion count came from the `DELETE`'s `rowCount`, which **PGlite does not populate** — so housekeeping reported zero deletions on the very database OpenMuse runs on. | Counted with a separate statement before the delete. |
+| 5 | `lib.rs` (`spark_icon`) | Slot width is 1 at the constants actually used, so the ordinary `- 2` gap **underflowed and would have panicked on first paint**. | `saturating_sub`, with the bounds now covered by unit tests (see Notes). |
+| 6 | `db.ts` (`trimOlderThan`) | The deletion count came from the `DELETE`'s `rowCount`. PGlite reports affected rows under **`affectedRows`**, not `rowCount`, and the `Database` interface declares `rowCount`, which PGlite leaves `undefined` — so housekeeping reported zero deletions on the very database OpenMuse runs on. | Counted from a separate statement before the delete (later replaced by `DELETE … RETURNING`, which cannot disagree with what it removed). |
 | 7 | `lib.rs` (`spark_icon`) | A zero or non-finite bar painted a one-pixel stub. | A bar with no height is no bar; zero and non-finite values are skipped. |
 
 ### Memory and resource leaks
@@ -132,9 +132,14 @@ than rewritten:
 - **`vault.ts` AAD is a constant.** A ciphertext copied between credential slots
   still decrypts. Hardening it would invalidate every already-encrypted
   credential, so it stays a conscious deferral recorded in `REVIEW.md`.
-- **Rust is unverified here.** No `cargo`/`rustc` in this environment, so the tray
-  blitter's bounds are proven by an equivalent standalone check rather than by a
-  compiler. Stated rather than glossed.
+- **The Rust layer had a compile error (now fixed).** `cargo` and `rustc` are
+  installed at `~/.cargo/bin` but were not on the default `PATH` during the
+  original review, which is why the crate went unbuilt. The `set_icon` call at
+  `lib.rs:409` was missing its `Some(..)` wrapper — the only compile error in
+  the crate — and has been corrected. `cargo build` is clean and `cargo test`
+  passes. The `spark_icon` bounds are now covered by dedicated unit tests rather
+  than by the "equivalent standalone check" that was claimed here before and
+  did not exist.
 
 ---
 
