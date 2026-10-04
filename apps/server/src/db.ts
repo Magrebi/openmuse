@@ -10,6 +10,27 @@ interface Database {
   close: () => Promise<void>;
 }
 
+/**
+ * How `listWhere` orders the records it returns.
+ *
+ * The order has to be named rather than assumed, because records of the same
+ * kind do not share one time field: a run event has `date`, an agent artifact
+ * has only `createdAt` inside its json. Sorting everything by `data->>'date'`
+ * silently collapsed a kind with no `date` to `id` order, which flipped artifact
+ * lists newest-first to oldest-first.
+ *
+ * `updated_desc` sorts the column the store maintains itself, so it holds for
+ * any record regardless of the shape of its own fields — the order the previous
+ * full `list` produced.
+ */
+export type ListOrder = "date_asc" | "updated_desc";
+
+/** Fixed SQL, so no caller-supplied text ever reaches the ORDER BY clause. */
+const ORDER_SQL: Record<ListOrder, string> = {
+  date_asc: "data->>'date' ASC,id ASC",
+  updated_desc: "updated_at DESC,id ASC",
+};
+
 export class Store {
   constructor(private readonly db: Database) {}
   async get<T = Record<string, unknown>>(
@@ -42,9 +63,12 @@ export class Store {
     kind: string,
     field: string,
     value: string,
+    order: ListOrder = "date_asc",
   ): Promise<T[]> {
     const result = await this.db.query(
-      `SELECT data FROM records WHERE owner=$1 AND kind=$2 AND data->>$3=$4 ORDER BY data->>'date' ASC,id ASC`,
+      `SELECT data FROM records WHERE owner=$1 AND kind=$2 AND data->>$3=$4 ORDER BY ${
+        ORDER_SQL[order]
+      }`,
       [owner, kind, field, value],
     );
     return result.rows.map((row) => row.data as T);
@@ -79,8 +103,16 @@ export class Store {
     };
     const haystack = fields.map((field) => `coalesce(${fieldRef(field)},'')`).join(" || ' ' || ");
     // One ILIKE term per word, ANDed: every word must appear somewhere.
+    //
+    // The pattern is built in the application, so `%`, `_` and `\` have to be
+    // escaped before they reach Postgres. Left raw they are wildcards: searching
+    // "100%" matched every body starting with "100", and because a backslash is
+    // itself an escape, searching "a\zb" dropped the row that really contained
+    // it and returned an unrelated one instead. Postgres reads the default LIKE
+    // escape character as a backslash, which is what `likeEscape` below relies on.
+    const likeEscape = (word: string) => word.toLowerCase().replace(/[\\%_]/g, (c) => `\\${c}`);
     const terms = words.map((word) => {
-      params.push(`%${word.toLowerCase()}%`);
+      params.push(`%${likeEscape(word)}%`);
       return `(${haystack}) ILIKE ($${params.length}::text)`;
     });
     // `coalesce` mirrors the old JavaScript, which read a missing label as "".
@@ -153,6 +185,7 @@ export class Store {
     const result = await this.db.query(
       `UPDATE records AS action SET data=jsonb_set(data,'{status}',$4::jsonb),updated_at=now()
        WHERE owner=$1 AND kind='actions' AND id=$2 AND data->>'status'='awaiting_review'
+       AND data->>'expiresAt' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$'
        AND (data->>'expiresAt')::timestamptz>$3::timestamptz
        AND ($4::jsonb <> '"executing"'::jsonb OR data->>'taskId' IS NULL OR EXISTS (
          SELECT 1 FROM records task WHERE task.owner=action.owner AND task.kind='tasks'
@@ -161,6 +194,19 @@ export class Store {
       [owner, id, now, JSON.stringify(status)],
     );
     return (result.rows[0]?.data as T | undefined) ?? null;
+  }
+  /**
+   * Delete the rows of one kind whose numeric `expiresAt` has already passed.
+   *
+   * Only rows that actually look like an epoch-millisecond expiry are considered,
+   * so a record missing `expiresAt` or holding something else is left alone instead
+   * of failing the statement and taking every other row down with it.
+   */
+  async pruneExpired(owner: string, kind: string, now: number): Promise<void> {
+    await this.db.query(
+      "DELETE FROM records WHERE owner=$1 AND kind=$2 AND data->>'expiresAt' ~ '^[0-9]+$' AND (data->>'expiresAt')::bigint<=$3",
+      [owner, kind, now],
+    );
   }
   async recoverInterruptedActions(): Promise<void> {
     await this.db.query(
