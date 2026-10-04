@@ -441,13 +441,27 @@ fn spark_icon(bars: &[f32]) -> tauri::image::Image<'static> {
     const HEIGHT: usize = 64;
     const INSET: usize = 40; // Leaves the status dot legible at the left.
     const BARS: usize = 16;
+    // The geometry below is written in saturating arithmetic on the assumption
+    // that these four constants are sane. If they are ever edited into an
+    // unsound combination, that must fail loudly here rather than silently
+    // painting nothing or writing past the buffer.
+    debug_assert!(
+        WIDTH > 0 && HEIGHT > 0 && BARS > 0 && INSET < WIDTH && INSET < HEIGHT,
+        "spark_icon constants are inconsistent"
+    );
     let mut rgba = vec![0u8; WIDTH * HEIGHT * 4];
     // Derived once, and with saturating arithmetic: at these constants the slot
     // width is 1, so an ordinary `- 2` for the gap would underflow and panic.
-    let span = (WIDTH - INSET) / BARS;
+    let span = WIDTH.saturating_sub(INSET) / BARS;
     let width = span.saturating_sub(1).max(1);
     for (slot, raw) in bars.iter().take(BARS).enumerate() {
-        let level = if raw.is_finite() { raw.clamp(0.0, 1.0) } else { 0.0 };
+        // NaN compares false against everything, so `is_finite` is what keeps a
+        // non-finite value from reaching the cast below as an arbitrary address.
+        let level = if raw.is_finite() {
+            raw.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         // A bar with no height is no bar. The TypeScript core already omits idle
         // samples, so reaching zero here means a malformed or hand-built call —
         // and painting a one-pixel stub for it would report activity that is
@@ -455,10 +469,12 @@ fn spark_icon(bars: &[f32]) -> tauri::image::Image<'static> {
         if level <= 0.0 {
             continue;
         }
-        let pixels = ((level * (HEIGHT - INSET) as f32).round() as usize).max(1);
-        let x0 = (INSET + slot * span).min(WIDTH - width);
+        let pixels = ((level * HEIGHT.saturating_sub(INSET) as f32).round() as usize).max(1);
+        // `.min` keeps the last slot's bar inside the buffer: without it a bar
+        // could start past `WIDTH - width` and write out of bounds.
+        let x0 = (INSET + slot * span).min(WIDTH.saturating_sub(width));
         for x in x0..x0 + width {
-            for y in HEIGHT - pixels..HEIGHT {
+            for y in HEIGHT.saturating_sub(pixels)..HEIGHT {
                 let offset = (y * WIDTH + x) * 4;
                 rgba[offset] = 0x14;
                 rgba[offset + 1] = 0x73;
