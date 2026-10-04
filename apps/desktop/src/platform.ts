@@ -36,8 +36,15 @@ export interface PlatformPorts extends FileIo {
   /** Read a value from the OS keychain. Secrets are not stored in app settings. */
   keychainGet(key: string): Promise<string | null>;
   keychainSet(key: string, value: string): Promise<void>;
-  /** Reflect the state machine in the system tray. */
-  traySet(tone: string, tooltip: string): Promise<void>;
+  /**
+   * Reflect the state machine in the system tray.
+   *
+   * `spark` is a short list of already-scaled bar heights, oldest first. It is a
+   * list rather than a picture so the platform layer stays a transport and every
+   * decision about what the bars mean stays in tested TypeScript. Optional, so a
+   * host implementation predating it still satisfies the port.
+   */
+  traySet(tone: string, tooltip: string, spark?: readonly number[]): Promise<void>;
   /** Raise an OS notification. */
   notify(title: string, body: string): Promise<void>;
   /** Point the app window at a URL. */

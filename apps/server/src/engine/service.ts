@@ -40,6 +40,14 @@ import { LostLeaseError, type TaskContext, TaskWorker } from "./worker.ts";
 const hash = (text: string) => createHash("sha256").update(text).digest("hex");
 const date = () => new Date().toISOString();
 const terminal = new Set(["succeeded", "failed", "cancelled"]);
+/**
+ * Statuses that mean the agent is doing something on its own.
+ *
+ * `waiting_approval` is deliberately absent. An agent holding a question is
+ * stopped, and counting it as working would make the tray look busiest exactly
+ * when it is blocked on a person.
+ */
+const WORKING_STATUSES = new Set(["queued", "running"]);
 export class AgentService {
   readonly worker: TaskWorker;
   private maintenance?: ReturnType<typeof setInterval>;
@@ -152,6 +160,23 @@ export class AgentService {
         lastTickAt: heartbeat?.lastTickAt ?? this.worker.lastTickAt,
       },
     };
+  }
+  /**
+   * How much work the agent has in flight, for an ambient status surface.
+   *
+   * A count rather than a list, deliberately: this is exposed on an unauthenticated
+   * health endpoint, and a task list would leak the contents of somebody's
+   * workspace to anything that can reach the port. A number says "busy" and
+   * nothing else.
+   *
+   * Derived from the statuses that mean "still going" and excludes the ones that
+   * mean a human is being asked, since a waiting approval is not the agent
+   * working — it is the agent stopped, holding a question.
+   */
+  async load(owner: string): Promise<number> {
+    await this.ensure(owner);
+    const tasks = await this.db.list<Pick<AgentTask, "status">>(owner, "tasks");
+    return tasks.filter((task) => WORKING_STATUSES.has(task.status)).length;
   }
   async getTask(owner: string, id: string) {
     const task = await this.db.get<AgentTask>(owner, "tasks", id);

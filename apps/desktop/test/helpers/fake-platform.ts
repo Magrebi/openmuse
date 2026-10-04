@@ -23,7 +23,8 @@ export const refused = () => {
 
 export interface Recorded {
   readonly commands: { program: string; args: string[]; cwd: string }[];
-  readonly tray: { tone: string; tooltip: string }[];
+  /** Every tray paint, in order. `spark` is absent before any activity. */
+  readonly tray: { tone: string; tooltip: string; spark?: number[] }[];
   readonly notifications: string[];
   readonly webviews: string[];
   readonly files: Record<string, string>;
@@ -79,8 +80,8 @@ export function fakePlatform(
     },
     keychainGet: async () => null,
     keychainSet: async () => undefined,
-    traySet: async (tone, tooltip) => {
-      recorded.tray.push({ tone, tooltip });
+    traySet: async (tone, tooltip, spark) => {
+      recorded.tray.push({ tone, tooltip, spark: spark ? [...spark] : undefined });
     },
     notify: async (_title, body) => {
       recorded.notifications.push(body);

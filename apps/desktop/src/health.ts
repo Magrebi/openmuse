@@ -8,6 +8,10 @@ export const healthPayloadSchema = z.object({
   mode: z.enum(["sample", "live"]),
   agentConfigured: z.boolean(),
   browserConfigured: z.boolean(),
+  // Outstanding work, so the tray can show the agent working rather than merely
+  // switched on. Optional because an older server will not send it, and the app
+  // must still start against one.
+  workerLoad: z.number().int().min(0).optional(),
 });
 
 export type HealthPayload = z.infer<typeof healthPayloadSchema>;

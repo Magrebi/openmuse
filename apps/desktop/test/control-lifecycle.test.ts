@@ -104,6 +104,81 @@ test("a degraded stack is announced once and shows amber", async () => {
   await app.stopAll();
 });
 
+test("the tray sparkline grows as the agent takes on work", async () => {
+  // The point of the tray: a long agent task looks identical to an idle one
+  // unless something shows it is working.
+  const loads = [0, 1, 3, 6];
+  let index = 0;
+  const fake = fakePlatform({
+    health: () => healthy({ workerLoad: loads[Math.min(index++, loads.length - 1)] }),
+  });
+  const app = build(fake);
+  await app.probe();
+  for (let i = 0; i < loads.length; i++) await app.pollHealth();
+  const painted = fake.recorded.tray.filter((entry) => entry.spark !== undefined);
+  assert.ok(painted.length > 0, "the tray should have been repainted with activity");
+  const last = painted.at(-1)?.spark ?? [];
+  assert.ok(last.length > 0, "a busy agent should draw bars");
+  // The newest sample is the tallest bar, because it is the current peak.
+  assert.equal(Math.max(...last), 1);
+  await app.stopAll();
+});
+
+test("an idle agent paints no bars rather than a row of stubs", async () => {
+  // A row of minimum-height bars reads as activity that is not happening.
+  const fake = fakePlatform({ health: () => healthy({ workerLoad: 0 }) });
+  const app = build(fake);
+  await app.probe();
+  await app.pollHealth();
+  const painted = fake.recorded.tray.filter((entry) => entry.spark !== undefined);
+  assert.ok(painted.length > 0);
+  assert.deepEqual(painted.at(-1)?.spark, []);
+  await app.stopAll();
+});
+
+test("a server too old to report a load is idle, not an error", async () => {
+  // The desktop app must still work against a server that predates the field.
+  const fake = fakePlatform({ health: () => healthy({}) });
+  const app = build(fake);
+  await app.probe();
+  await app.pollHealth();
+  assert.equal(app.state.state, "healthy");
+  const painted = fake.recorded.tray.filter((entry) => entry.spark !== undefined);
+  assert.deepEqual(painted.at(-1)?.spark, []);
+  await app.stopAll();
+});
+
+test("the tray tooltip says what the agent is doing", async () => {
+  const fake = fakePlatform({ health: () => healthy({ workerLoad: 3 }) });
+  const app = build(fake);
+  await app.probe();
+  await app.pollHealth();
+  assert.ok(
+    fake.recorded.tray.some((entry) => entry.tooltip.includes("3 items in flight")),
+    "the tooltip should describe the outstanding work",
+  );
+  await app.stopAll();
+});
+
+test("a tray failure does not disturb the poll loop", async () => {
+  // The sparkline repaints outside the state machine, so a throwing tray is a
+  // new way for the poll loop to break.
+  const fake = fakePlatform({ health: () => healthy({ workerLoad: 2 }) });
+  const app = build(fake, {
+    ports: {
+      ...fake.ports,
+      traySet: async () => {
+        throw new Error("no tray on this desktop");
+      },
+    },
+  });
+  await app.probe();
+  await app.pollHealth();
+  await app.pollHealth();
+  assert.equal(app.state.state, "healthy");
+  await app.stopAll();
+});
+
 test("an API that dies after a healthy start degrades rather than erroring", async () => {
   const fake = fakePlatform({ health: refused });
   const app = build(fake);

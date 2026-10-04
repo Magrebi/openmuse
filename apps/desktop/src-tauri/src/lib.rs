@@ -371,9 +371,22 @@ fn emit_log(app: AppHandle, service: String, line: String) {
 
 /// Push the state machine's tone into the tray and, for a transition worth
 /// interrupting for, an OS notification.
+///
+/// `spark` is a short list of bar heights in `0.0..=1.0`, oldest first, already
+/// scaled by the TypeScript core. It arrives as a list rather than a bitmap so
+/// that every decision about what the bars mean stays in code that is unit
+/// tested; this layer only blits. An absent or empty list means the agent is
+/// idle, and the plain icon is correct — drawing minimum-height stubs would
+/// report activity that is not happening.
 #[tauri::command]
-fn announce(app: AppHandle, tone: String, state: String, notify: Option<String>) -> Result<()> {
-    set_tray(&app, &tone, &state);
+fn announce(
+    app: AppHandle,
+    tone: String,
+    state: String,
+    notify: Option<String>,
+    spark: Option<Vec<f32>>,
+) -> Result<()> {
+    set_tray(&app, &tone, &state, spark.as_deref());
     if let Some(body) = notify {
         let _ = app
             .notification()
@@ -385,13 +398,56 @@ fn announce(app: AppHandle, tone: String, state: String, notify: Option<String>)
     Ok(())
 }
 
-fn set_tray(app: &AppHandle, tone: &str, state: &str) {
+fn set_tray(app: &AppHandle, tone: &str, state: &str, spark: Option<&[f32]>) {
     let Some(tray) = app.tray_by_id("openmuse") else {
         return;
     };
     // The tooltip carries both the state and its tone, so the tray colour and
     // the status page can never disagree about which state this is.
     let _ = tray.set_tooltip(Some(format!("OpenMuse — {} ({})", state, tone)));
+    if let Some(bars) = spark {
+        let _ = tray.set_icon(spark_icon(bars));
+    }
+}
+
+/// Bars in `0.0..=1.0` become a row of columns, oldest on the left.
+///
+/// Values are clamped rather than trusted: they cross a process boundary from a
+/// webview, and an unclamped height would index outside the pixel buffer.
+/// Non-finite values are treated as zero for the same reason — a NaN reaching
+/// the cast below would become an arbitrary address.
+fn spark_icon(bars: &[f32]) -> tauri::image::Image<'static> {
+    const WIDTH: usize = 64;
+    const HEIGHT: usize = 64;
+    const INSET: usize = 40; // Leaves the status dot legible at the left.
+    const BARS: usize = 16;
+    let mut rgba = vec![0u8; WIDTH * HEIGHT * 4];
+    // Derived once, and with saturating arithmetic: at these constants the slot
+    // width is 1, so an ordinary `- 2` for the gap would underflow and panic.
+    let span = (WIDTH - INSET) / BARS;
+    let width = span.saturating_sub(1).max(1);
+    for (slot, raw) in bars.iter().take(BARS).enumerate() {
+        let level = if raw.is_finite() { raw.clamp(0.0, 1.0) } else { 0.0 };
+        // A bar with no height is no bar. The TypeScript core already omits idle
+        // samples, so reaching zero here means a malformed or hand-built call —
+        // and painting a one-pixel stub for it would report activity that is
+        // not happening, which is the one thing the sparkline must never do.
+        if level <= 0.0 {
+            continue;
+        }
+        let pixels = ((level * (HEIGHT - INSET) as f32).round() as usize).max(1);
+        let x0 = (INSET + slot * span).min(WIDTH - width);
+        for x in x0..x0 + width {
+            for y in HEIGHT - pixels..HEIGHT {
+                let offset = (y * WIDTH + x) * 4;
+                rgba[offset] = 0x14;
+                rgba[offset + 1] = 0x73;
+                rgba[offset + 2] = 0xC8;
+                rgba[offset + 3] = 0xFF;
+            }
+        }
+    }
+    tauri::image::Image::new_owned(rgba, WIDTH as u32, HEIGHT as u32)
 }
 
 fn build_tray(app: &AppHandle) -> tauri::Result<()> {

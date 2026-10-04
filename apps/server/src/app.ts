@@ -26,6 +26,15 @@ import { GoogleAuth } from "./google-auth.ts";
 import { UndoQueue } from "./undo.ts";
 import { WorkspaceService } from "./workspace.ts";
 
+/**
+ * The owner used before anyone has signed in.
+ *
+ * OpenMuse is a single-user, self-hosted app, and a few things have to happen
+ * before a session exists: the sample workspace is seeded, and the health probe
+ * the desktop app polls runs pre-auth. Both address the one local workspace.
+ */
+const LOCAL_OWNER = "local-user";
+
 export async function createApp(
   db: Store,
   config: Config,
@@ -97,12 +106,17 @@ export async function createApp(
       502,
     );
   });
-  app.get("/api/health", (c) =>
+  app.get("/api/health", async (c) =>
     c.json({
       ok: true,
       mode: config.mode,
       agentConfigured: agentConfigured(config),
       browserConfigured: Boolean(config.workerUrl && config.workerToken),
+      // How much the agent has in flight, so an ambient surface can show that it
+      // is working rather than merely switched on. A count for the single local
+      // owner, which is the only workspace this endpoint can describe without a
+      // session: it is reachable before anyone has signed in.
+      workerLoad: await agent.load(LOCAL_OWNER),
     }),
   );
   let loginWindow = 0,
@@ -116,9 +130,9 @@ export async function createApp(
       throw new AppError("Too many sign-in attempts. Try again in a minute.", 429);
     const body = z.object({ accessKey: z.string().optional() }).parse(await c.req.json());
     const session = await auth.session(body.accessKey);
-    await workspace.ensureSample("local-user", actions);
-    await agent.ensure("local-user");
-    if (config.mode === "sample") await agent.refreshIdeas("local-user");
+    await workspace.ensureSample(LOCAL_OWNER, actions);
+    await agent.ensure(LOCAL_OWNER);
+    if (config.mode === "sample") await agent.refreshIdeas(LOCAL_OWNER);
     return c.json(session);
   });
   app.get("/api/google/callback", async (c) => {

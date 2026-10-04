@@ -13,6 +13,7 @@ import { errorCode } from "./errors.js";
 import { assertLoopback, readHealth } from "./health.js";
 import type { Clock, PlatformPorts, ProcessHandle } from "./platform.js";
 import { redact } from "./secrets.js";
+import { Sparkline } from "./sparkline.js";
 import {
   type Deployment,
   type DeploymentEvent,
@@ -25,6 +26,8 @@ export const healthIntervalMs = 5000;
 export const startTimeoutMs = 90_000;
 export const webUrl = "http://127.0.0.1:8081";
 export const healthUrl = "http://127.0.0.1:8787/api/health";
+/** How many bars the tray sparkline draws. */
+export const SPARK_WIDTH = 16;
 
 export interface ControllerOptions {
   readonly ports: PlatformPorts;
@@ -43,6 +46,27 @@ const fixedClock: Clock = { now: () => Date.now() };
  * Owns the one deployment state machine and drives it from compose exit codes
  * and health polls. Surfaces subscribe; none of them keeps its own copy.
  */
+/**
+ * Bar heights for the tray, scaled to the 0..1 range the platform layer draws.
+ *
+ * The sparkline works in y coordinates because that is what a line needs; a tray
+ * draws bars, so the same samples are handed over as heights. Exported as a
+ * function of the samples rather than read off the object so the mapping is
+ * testable without a tray.
+ */
+export function sparkBars(points: readonly { y: number }[], height: number): number[] {
+  const h = Math.max(1, Math.floor(height));
+  // Clamped to the last *addressable* row, not to `h`. Clamping to `h` lets a
+  // point on the floor scale to 1.1, and the tray would then be asked to draw a
+  // bar taller than the icon that contains it.
+  const floor = h - 1;
+  const span = floor || 1;
+  return points.map((point) => {
+    const clamped = Math.max(0, Math.min(floor, point.y));
+    return Math.round(((floor - clamped) / span) * 100) / 100;
+  });
+}
+
 export class DeploymentController {
   private deployment: Deployment = initialDeployment();
   private readonly listeners = new Set<Listener>();
@@ -51,6 +75,10 @@ export class DeploymentController {
   private startedAt = 0;
   private secrets: string[] = [];
   private lastAnnounced = "";
+  /** Recent agent activity, for the tray. Bounded; see `sparkline.ts`. */
+  private readonly spark = new Sparkline();
+  /** Height in tray pixels the sparkline is drawn at. */
+  private static readonly SPARK_HEIGHT = 16;
   /** Set by stopAll; blocks further scheduling so nothing keeps the loop alive. */
   private closed = false;
 
@@ -84,6 +112,34 @@ export class DeploymentController {
     return next;
   }
 
+  /**
+   * The sparkline as bar heights, or nothing when there is nothing to draw.
+   *
+   * Returning an empty list rather than a flat line matters: an idle agent should
+   * show the plain tray icon, not a row of minimum-height stubs that reads as
+   * activity that is not there.
+   */
+  private bars(): number[] {
+    if (!this.spark.hasSignal) return [];
+    return sparkBars(
+      this.spark.points(SPARK_WIDTH, DeploymentController.SPARK_HEIGHT),
+      SPARK_WIDTH,
+    );
+  }
+
+  /**
+   * Repaint the tray after new activity, without going through the state
+   * machine. A busy agent produces no deployment transitions, so `announce` would
+   * never fire and the sparkline would only ever show the state at startup.
+   */
+  private refreshTray(): void {
+    void this.options.ports
+      .traySet(toneFor(this.deployment.state), `OpenMuse — ${this.spark.summary()}`, this.bars())
+      .catch(() => {
+        // A tray failure must not disturb the deployment or the poll loop.
+      });
+  }
+
   /** Remember values that must be stripped from any captured output. */
   setSecrets(values: string[]): void {
     this.secrets = values.filter((value) => Boolean(value));
@@ -92,7 +148,11 @@ export class DeploymentController {
   /** Mirror the machine into the tray, and notify on healthy, degraded and error. */
   private async announce(deployment: Deployment): Promise<void> {
     try {
-      await this.options.ports.traySet(toneFor(deployment.state), `OpenMuse — ${deployment.state}`);
+      await this.options.ports.traySet(
+        toneFor(deployment.state),
+        `OpenMuse — ${deployment.state}`,
+        this.bars(),
+      );
       const message =
         deployment.state === "healthy"
           ? "OpenMuse is running."
@@ -134,6 +194,14 @@ export class DeploymentController {
     const interval = this.options.healthIntervalMs ?? healthIntervalMs;
     const before = this.deployment.state;
     const reading = await readHealth(healthUrl, this.options.fetchImpl, 2000);
+    // Recorded from every answered poll, including a degraded one, because "the
+    // agent is busy and something is also wrong" is exactly when somebody is
+    // watching the tray. A server too old to report a load contributes a zero,
+    // which reads as idle rather than as an error.
+    if (reading.probe === "healthy" || reading.probe === "degraded") {
+      this.spark.push({ at: this.clock.now(), load: reading.payload?.workerLoad ?? 0 });
+      this.refreshTray();
+    }
 
     if (reading.probe === "healthy") {
       this.dispatch({ type: "HEALTH_OK" });
