@@ -437,24 +437,57 @@ fn set_tray(app: &AppHandle, tone: &str, state: &str, spark: Option<&[f32]>) {
 /// Non-finite values are treated as zero for the same reason — a NaN reaching
 /// the cast below would become an arbitrary address.
 fn spark_icon(bars: &[f32]) -> tauri::image::Image<'static> {
-    const WIDTH: usize = 64;
-    const HEIGHT: usize = 64;
-    const INSET: usize = 40; // Leaves the status dot legible at the left.
-    const BARS: usize = 16;
-    // The geometry below is written in saturating arithmetic on the assumption
-    // that these four constants are sane. If they are ever edited into an
-    // unsound combination, that must fail loudly here rather than silently
-    // painting nothing or writing past the buffer.
+    let (rgba, width, height) = spark_rgba(bars);
+    tauri::image::Image::new_owned(rgba, width, height)
+}
+
+/// The blitter's geometry, shared by the raster and its tests.
+const SPARK_WIDTH: usize = 64;
+const SPARK_HEIGHT: usize = 64;
+const SPARK_INSET: usize = 40; // Leaves the status dot legible at the left.
+const SPARK_BARS: usize = 16;
+
+/// Paint the bars into a raw RGBA buffer and return it with its dimensions.
+///
+/// Separated from `spark_icon` so the bounds are provable by a unit test rather
+/// than only by inspection: `Image`'s pixel data is not readable back out of an
+/// owned image, so the raster is what the tests actually assert on.
+fn spark_rgba(bars: &[f32]) -> (Vec<u8>, u32, u32) {
+    // The invariant the saturating arithmetic in `rasterize` silently degrades
+    // to "paints nothing": it is asserted here, on the shipping geometry, so a
+    // bad edit to these constants fails immediately rather than turning the
+    // sparkline into a blank icon nobody can explain.
     debug_assert!(
-        WIDTH > 0 && HEIGHT > 0 && BARS > 0 && INSET < WIDTH && INSET < HEIGHT,
+        SPARK_WIDTH > 0
+            && SPARK_HEIGHT > 0
+            && SPARK_BARS > 0
+            && SPARK_INSET < SPARK_WIDTH
+            && SPARK_INSET < SPARK_HEIGHT,
         "spark_icon constants are inconsistent"
     );
-    let mut rgba = vec![0u8; WIDTH * HEIGHT * 4];
-    // Derived once, and with saturating arithmetic: at these constants the slot
-    // width is 1, so an ordinary `- 2` for the gap would underflow and panic.
-    let span = WIDTH.saturating_sub(INSET) / BARS;
+    rasterize(bars, SPARK_WIDTH, SPARK_HEIGHT, SPARK_INSET, SPARK_BARS)
+}
+
+/// The blitter itself, with its geometry as arguments.
+///
+/// At the shipped constants the `.min` and `.max` clamps below never actually
+/// bind, so passing the geometry in is what lets a test drive a hostile one (an
+/// inset wider than the icon, a slot count that does not divide the span) and
+/// prove the arithmetic stays in bounds instead of underflowing.
+fn rasterize(
+    bars: &[f32],
+    width_px: usize,
+    height_px: usize,
+    inset: usize,
+    slots: usize,
+) -> (Vec<u8>, u32, u32) {
+    let mut rgba = vec![0u8; width_px * height_px * 4];
+    // Every subtraction below saturates, so a geometry that would underflow
+    // paints nothing rather than panicking. The invariant that keeps the result
+    // *meaningful* is asserted where the shipping constants are declared.
+    let span = width_px.saturating_sub(inset) / slots.max(1);
     let width = span.saturating_sub(1).max(1);
-    for (slot, raw) in bars.iter().take(BARS).enumerate() {
+    for (slot, raw) in bars.iter().take(slots).enumerate() {
         // NaN compares false against everything, so `is_finite` is what keeps a
         // non-finite value from reaching the cast below as an arbitrary address.
         let level = if raw.is_finite() {
@@ -469,13 +502,13 @@ fn spark_icon(bars: &[f32]) -> tauri::image::Image<'static> {
         if level <= 0.0 {
             continue;
         }
-        let pixels = ((level * HEIGHT.saturating_sub(INSET) as f32).round() as usize).max(1);
+        let pixels = ((level * height_px.saturating_sub(inset) as f32).round() as usize).max(1);
         // `.min` keeps the last slot's bar inside the buffer: without it a bar
-        // could start past `WIDTH - width` and write out of bounds.
-        let x0 = (INSET + slot * span).min(WIDTH.saturating_sub(width));
+        // could start past `width_px - width` and write out of bounds.
+        let x0 = (inset + slot * span).min(width_px.saturating_sub(width));
         for x in x0..x0 + width {
-            for y in HEIGHT.saturating_sub(pixels)..HEIGHT {
-                let offset = (y * WIDTH + x) * 4;
+            for y in height_px.saturating_sub(pixels)..height_px {
+                let offset = (y * width_px + x) * 4;
                 rgba[offset] = 0x14;
                 rgba[offset + 1] = 0x73;
                 rgba[offset + 2] = 0xC8;
@@ -483,7 +516,209 @@ fn spark_icon(bars: &[f32]) -> tauri::image::Image<'static> {
             }
         }
     }
-    tauri::image::Image::new_owned(rgba, WIDTH as u32, HEIGHT as u32)
+    (rgba, width_px as u32, height_px as u32)
+}
+
+#[cfg(test)]
+mod spark_tests {
+    use super::*;
+
+    /// The alpha channel at a pixel, so a test can ask whether it was painted.
+    fn alpha(rgba: &[u8], x: usize, y: usize) -> u8 {
+        rgba[(y * SPARK_WIDTH + x) * 4 + 3]
+    }
+
+    /// Every pixel the raster touched, as `(x, y)`, for an icon of the given size.
+    fn painted(rgba: &[u8], width_px: usize, height_px: usize) -> Vec<(usize, usize)> {
+        (0..height_px)
+            .flat_map(|y| (0..width_px).map(move |x| (x, y)))
+            .filter(|&(x, y)| rgba[(y * width_px + x) * 4 + 3] != 0)
+            .collect()
+    }
+
+    /// Painted pixels at the shipping geometry.
+    fn painted_default(rgba: &[u8]) -> Vec<(usize, usize)> {
+        painted(rgba, SPARK_WIDTH, SPARK_HEIGHT)
+    }
+
+    /// The buffer never exceeds the declared geometry, whatever is painted.
+    fn assert_within_bounds(rgba: &[u8]) {
+        assert_eq!(
+            rgba.len(),
+            SPARK_WIDTH * SPARK_HEIGHT * 4,
+            "the raster must fill exactly its declared geometry"
+        );
+    }
+
+    #[test]
+    fn every_input_yields_a_64_by_64_icon() {
+        // `Image` is the shipping type, so the wrapper is asserted directly as
+        // well as the raster underneath it.
+        for bars in [
+            &[][..],
+            &[0.0][..],
+            &[1.0][..],
+            &[f32::NAN][..],
+            &[f32::INFINITY, f32::NEG_INFINITY][..],
+            &vec![1.0; 64][..],
+        ] {
+            let image = spark_icon(bars);
+            assert_eq!(image.width(), 64);
+            assert_eq!(image.height(), 64);
+            let (rgba, width, height) = spark_rgba(bars);
+            assert_within_bounds(&rgba);
+            assert_eq!((width, height), (64, 64));
+        }
+    }
+
+    #[test]
+    fn an_idle_window_paints_nothing_at_all() {
+        // The transparent case that blanked the tray: no bar may be invented for
+        // an agent that is doing nothing.
+        let (rgba, _, _) = spark_rgba(&[]);
+        assert_within_bounds(&rgba);
+        assert_eq!(painted_default(&rgba), Vec::<(usize, usize)>::new());
+        assert!(rgba.iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn a_non_finite_bar_paints_nothing() {
+        // NaN compares false against every comparison, so it would sail past a
+        // `<= 0.0` guard on a value that was never clamped.
+        for level in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let (rgba, _, _) = spark_rgba(&[level]);
+            assert_within_bounds(&rgba);
+            assert_eq!(
+                painted_default(&rgba),
+                Vec::<(usize, usize)>::new(),
+                "{level}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_negative_bar_is_skipped_rather_than_clamped_to_a_stub() {
+        let (rgba, _, _) = spark_rgba(&[-0.5, -1.0, -0.0]);
+        assert_within_bounds(&rgba);
+        assert_eq!(painted_default(&rgba), Vec::<(usize, usize)>::new());
+    }
+
+    #[test]
+    fn a_single_half_height_bar_lands_where_the_geometry_says() {
+        // At the shipped constants each slot is one pixel wide, starting at
+        // SPARK_INSET, and half a bar is half of HEIGHT - INSET tall.
+        let (rgba, _, _) = spark_rgba(&[0.5]);
+        assert_within_bounds(&rgba);
+        let lit = painted_default(&rgba);
+        assert_eq!(lit.len(), 12, "half of the 24-pixel drawable height");
+        // Slot 0 is the leftmost column of the bar area.
+        assert!(lit.contains(&(40, 63)), "the bottom row must be painted");
+        assert!(
+            lit.contains(&(40, 52)),
+            "the top of the bar must be painted"
+        );
+        assert_eq!(alpha(&rgba, 40, 51), 0, "above the bar is untouched");
+        assert_eq!(alpha(&rgba, 39, 63), 0, "the inset stays clear");
+        assert_eq!(alpha(&rgba, 41, 63), 0, "no neighbouring slot is lit");
+    }
+
+    #[test]
+    fn every_bar_at_full_height_stays_inside_the_buffer() {
+        // The maximum case: the topmost and rightmost slots are the ones that
+        // would run off the end if the arithmetic were wrong.
+        let full = vec![1.0; SPARK_BARS];
+        let (rgba, _, _) = spark_rgba(&full);
+        assert_within_bounds(&rgba);
+        let lit = painted_default(&rgba);
+        assert_eq!(lit.len(), SPARK_BARS * 24, "16 bars of 24 pixels each");
+        assert!(lit.contains(&(40, 40)), "the first slot's top row");
+        assert!(lit.contains(&(55, 40)), "the last slot's top row");
+        assert!(!lit.iter().any(|&(x, _)| x < 40 || x >= 56));
+        assert!(!lit.iter().any(|&(_, y)| y < 40));
+    }
+
+    #[test]
+    fn a_window_longer_than_the_icon_is_truncated_not_overflowed() {
+        // More samples than slots: the extras are dropped, and dropping them
+        // must not shift or overwrite the bars that did fit.
+        let mut bars = vec![0.0; 64];
+        for bar in bars.iter_mut().take(SPARK_BARS) {
+            *bar = 1.0;
+        }
+        let (rgba, _, _) = spark_rgba(&bars);
+        assert_within_bounds(&rgba);
+        assert_eq!(painted_default(&rgba).len(), SPARK_BARS * 24);
+        let (short, _, _) = spark_rgba(&vec![1.0; SPARK_BARS]);
+        assert_eq!(
+            painted_default(&rgba),
+            painted_default(&short),
+            "the first 16 samples must render identically however many follow"
+        );
+    }
+
+    #[test]
+    fn a_partial_bar_never_paints_a_minimum_height_stub() {
+        // A level small enough to round to zero would otherwise become a
+        // one-pixel bar, reporting activity that is not happening.
+        let (rgba, _, _) = spark_rgba(&[0.001]);
+        assert_within_bounds(&rgba);
+        let lit = painted_default(&rgba);
+        assert_eq!(lit.len(), 1, "one pixel, and no more");
+        assert_eq!(lit[0], (40, 63));
+    }
+
+    #[test]
+    fn a_hostile_geometry_paints_nothing_rather_than_panicking() {
+        // The reason every subtraction saturates. None of these can occur at the
+        // shipped constants, which is exactly why they need a test: an inset
+        // wider than the icon, an inset equal to the icon, and a slot count that
+        // does not divide the span all used to be an ordinary `-` and a panic in
+        // a debug build.
+        let cases = [
+            (16usize, 16usize, 40usize, 16usize), // inset far wider than the icon
+            (16, 16, 16, 16),                     // inset exactly the width
+            (16, 16, 15, 16),                     // one pixel of bar area
+            (8, 8, 0, 16),                        // no inset at all
+            (16, 16, 8, 3),                       // span does not divide evenly
+            (16, 16, 8, 64),                      // more slots than pixels
+            (1, 1, 0, 1),                         // a one-pixel icon
+            (16, 16, 8, 0),                       // no slots at all
+            (64, 64, 40, usize::MAX),             // an absurd slot count
+        ];
+        for (width_px, height_px, inset, slots) in cases {
+            let (rgba, width, height) = rasterize(&[1.0; 32], width_px, height_px, inset, slots);
+            assert_eq!(
+                rgba.len(),
+                width_px * height_px * 4,
+                "{width_px}x{height_px} inset {inset} slots {slots}: buffer size"
+            );
+            assert_eq!((width, height), (width_px as u32, height_px as u32));
+            // Anything painted at all must be a real pixel of this icon.
+            for (x, y) in painted(&rgba, width_px, height_px) {
+                assert!(x < width_px, "{x} is outside {width_px}");
+                assert!(y < height_px, "{y} is outside {height_px}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_dense_row_of_slots_stays_inside_the_icon() {
+        // Many slots across a narrow icon: each bar is placed from its slot index,
+        // so this is the geometry where the `.min` on `x0` would matter if the
+        // arithmetic were wrong. (With the shipped constants it cannot bind —
+        // that is the point of asserting the bound instead of the clamp.)
+        let (rgba, _, _) = rasterize(&[1.0; 64], 32, 32, 8, 12);
+        assert_eq!(rgba.len(), 32 * 32 * 4);
+        let lit = painted(&rgba, 32, 32);
+        assert!(!lit.is_empty(), "bars must still be drawn");
+        for &(x, y) in &lit {
+            assert!(x < 32 && y < 32, "({x},{y}) escaped the 32x32 icon");
+        }
+        // Nothing is drawn in the inset area on the left.
+        for (x, _) in &lit {
+            assert!(*x >= 8, "a bar was drawn over the status dot area");
+        }
+    }
 }
 
 fn build_tray(app: &AppHandle) -> tauri::Result<()> {
