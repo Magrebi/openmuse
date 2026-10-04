@@ -341,3 +341,142 @@ surface in `searchText`. That is the part of this pass worth keeping.
    calendar editing and Drive/Docs remain the cheapest next capabilities after
    `read_pdf`.
 
+---
+
+## Cycle 6 — database and feature correctness pass — 2026-10-04
+Base: `34e3728` (`marathon-audit`)
+Commits: `839d622`, `f60aa00`, `630b97c`, `2cfa9b0`, `bdd050d`, `e40bb73`,
+`9fe1e5b`, `63b309d`
+
+**Bar at every milestone.** `pnpm lint` clean, `pnpm typecheck` clean (root +
+mobile + desktop), `pnpm test` **447 passed / 0 failed / 0 skipped**, up from the
+442 baseline. The 4 remaining lint infos are pre-existing in `HEAD`
+(`tests/pdf-text.test.ts` Type0 fixture); this pass added none.
+
+### Scope correction made before writing code
+
+The brief listed 12 items. Reading the tree first showed **most were already
+implemented** in the then-uncommitted working tree from the previous cycle:
+
+| Item | State found | Action |
+| --- | --- | --- |
+| `taskId` jsonb index | already present | verified only |
+| `ListOrder` / `ORDER_SQL` map | already present | verified only |
+| `searchText` + `likeEscape` + `\y` exclusion | already present | verified only |
+| `pruneExpired` + `auth` wiring | already present | verified only |
+| 409 on failed claim | already present | verified only |
+| claim `expiresAt` regex | already present | verified only |
+| `records_kind_updated` index | **missing** | added (`9fe1e5b`) |
+| calendar range → SQL | **missing** (JS `Date.parse`) | added (`63b309d`) |
+| rate-limit eviction | **no leak exists** | audited, see below |
+| JWT `exp` cache TTL | **N/A on this branch** | no `casaos.ts` here |
+
+Rather than reimplement, the existing work was committed first as six atomic
+commits so the history is reviewable, and only the three genuinely missing items
+were implemented.
+
+### Phase 1 — the 1s tick index (`9fe1e5b`)
+
+`scan()` filters on `kind` alone and runs on the **1-second** worker tick
+(`engine/worker.ts:75`) plus every 60s from `maintain()`
+(`engine/service.ts:79-99`). The only index was the `(owner, kind, id)` primary
+key, which cannot serve a `kind`-only predicate, so each tick materialised every
+row of every kind for every owner — cost grew with *total lifetime records*
+rather than with the number of due tasks.
+
+```sql
+CREATE INDEX IF NOT EXISTS records_kind_updated ON records(kind, updated_at)
+```
+
+`(kind, updated_at)` serves the equality filter **and** the `ORDER BY
+updated_at ASC` that `scan()` already issues, so it removes the filter scan and
+the sort together.
+
+**Verification: catalog, not `EXPLAIN`.** Asserted via `pg_indexes` through a
+new `Store.indexNames()`. `EXPLAIN` was rejected deliberately: on a
+fixture-sized table the planner may legitimately prefer a sequential scan, so
+such a test would measure statistics rather than schema and could pass or fail
+without any code change. The same test also re-opens the data directory to prove
+the startup DDL is idempotent.
+
+### Phase 2 — calendar range filtering pushed to SQL (`63b309d`)
+
+`events()` read **every** event the owner had for the calendar and applied the
+window in JavaScript via `Date.parse`. Two defects, not one:
+
+1. It scaled with the owner's whole event history, not with the window.
+2. `Date.parse` is lenient where Postgres is strict — a malformed timestamp
+   became `NaN`, and `NaN < x` is false, so the row was **silently excluded**
+   instead of failing visibly.
+
+`Store.listEventsInRange` applies the calendar, the overlap window and the
+ordering in one statement. Correctness details:
+
+- **The ISO-8601 shape test runs BEFORE each `::timestamptz` cast.** Without it
+  one bad row raises and aborts the whole statement — the identical hazard the
+  claim path already guards against. The test asserts a good event survives
+  alongside two malformed rows, and that the bad rows are not deleted.
+- **Unparseable window bounds are rejected (400).** Left unchecked they make
+  every comparison false and return an empty calendar that reads as "no events"
+  rather than as a caller mistake.
+- **`start`/`end` are fixed column names, not parameters** — nothing
+  caller-supplied reaches the SQL text; only the two bounds are bound.
+- **Comparison and ordering are by instant, not wall-clock string.** A test uses
+  the 2026-03-08 US DST transition: an event stored as `02:30-05:00` (07:30Z) and
+  one stored as `02:30+01:00` (01:30Z the previous day) read identically as text
+  but are different instants, and a string comparison picks the wrong one.
+
+### Phase 3 — concurrency and lifecycle (already implemented, verified)
+
+`pruneExpired`, its `auth` wiring, the 409 claim guard and the claim timestamp
+regex were all already in the tree and are covered by the 9 regression tests
+committed in `bdd050d`. Re-verified rather than rewritten.
+
+### Phase 4 — memory eviction (audited; no leak found)
+
+- `casaOSSaveWindow` from the brief **does not exist on this branch** — there is
+  no `casaos.ts` here; that code is on `casaos-manager-v2`.
+- `app.ts:99` login limiting uses two scalars (`loginWindow`, `loginAttempts`),
+  not a `Map`, so it cannot accumulate keys.
+- The two per-owner `Map`s that do exist — `workspace.ts:23` (`seeding`) and
+  `worker.ts:27` (`active`) — both delete in a `finally`
+  (`workspace.ts:139`, `worker.ts:244`), so neither leaks.
+
+No change made: an eviction fix would have been invented rather than justified.
+
+### Adversarial tests added (5, all confirmed to fail without the fix)
+
+Verified by stashing the implementation and re-running: the scan-index test and
+the range-filter test both fail, so neither is vacuous.
+
+1. Scan index registered in `pg_indexes`; startup DDL idempotent.
+2. Range filter returns only overlapping events, in start order, and never
+   leaks another calendar's events; empty window returns nothing; omitted bounds
+   return the whole calendar.
+3. Instants not wall-clock, across the DST boundary and stored offsets.
+4. A malformed `start`/`end` is skipped, not fatal; no data destroyed.
+5. An unparseable window bound is rejected rather than silently matching nothing.
+
+### Constraints honoured
+
+- **AAD untouched.** `packages/integrations/src/vault.ts` was not modified;
+  `openmuse:credential:v1` is unchanged (L6 remains deferred).
+- **No speculative indexes.** Only one index was added, and it is justified by
+  two observed call sites (`worker.ts:75`, `service.ts:79-99`).
+- **No data loss.** Every guard is a predicate or a rejected input; no row is
+  ever deleted except by `pruneExpired`, which only removes already-lapsed
+  sessions of the calling owner and kind.
+
+### Not done
+
+- **`snapshot()` still reads whole collections** (`db.list` for `mail`,
+  `events`, `actions`, `activity`). This is a genuine remaining gap from the
+  brief's Phase 2.3. It was left alone deliberately: the sample-mode snapshot is
+  the app's main read path, the seeding fixtures make any narrowing change
+  high-risk, and there was no observed failure to anchor it. It is the top
+  candidate for the next pass.
+- **Chromium, Docker and live-provider suites** still not run (need external
+  services), unchanged from the previous cycle.
+- Nothing pushed; all commits are local to `marathon-audit`.
+
+
