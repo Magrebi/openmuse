@@ -607,6 +607,32 @@ test("listRecent clamps a limit that would be a full table scan", async () => {
   }
 });
 
+test("listRecent survives a limit that is not a number", async () => {
+  // The NaN hole: Math.min/max propagate NaN, so the clamp returned NaN, which
+  // PGlite rejects as a bigint cast. A workspace refresh must degrade to "here
+  // are the recent ones", not to an error page.
+  const root = await mkdtemp(join(tmpdir(), "openmuse-db-clamp-nan-"));
+  try {
+    const db = await createStore({ dataDir: join(root, "pg") });
+    for (let i = 0; i < 5; i++) {
+      await db.put("owner", "activity", { id: `a${i}` });
+      await new Promise((r) => setTimeout(r, 2));
+    }
+    // NaN and ±Infinity all fall back to the 1_000 ceiling, which is above the
+    // row count, so the read still returns everything it should.
+    assert.equal((await db.listRecent("owner", "activity", Number.NaN)).length, 5);
+    assert.equal((await db.listRecent("owner", "activity", Number.POSITIVE_INFINITY)).length, 5);
+    assert.equal((await db.listRecent("owner", "activity", Number.NEG_INFINITY)).length, 5);
+    // A finite negative clamps to 1, as before.
+    assert.equal((await db.listRecent("owner", "activity", -3)).length, 1);
+    // A fractional limit floors rather than failing the cast.
+    assert.equal((await db.listRecent("owner", "activity", 2.9)).length, 2);
+    await db.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("trimOlderThan keeps the newest rows and deletes the rest", async () => {
   const root = await mkdtemp(join(tmpdir(), "openmuse-db-trim-"));
   try {
@@ -625,6 +651,84 @@ test("trimOlderThan keeps the newest rows and deletes the rest", async () => {
       19,
       "the newest rows must be the ones that survive",
     );
+    await db.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("trimOlderThan reports exactly the rows it deleted", async () => {
+  // The count is now the DELETE's own RETURNING count. If it ever came from a
+  // separate COUNT again, a concurrent insert between the two statements would
+  // make the number disagree with the table, which is what this asserts.
+  const root = await mkdtemp(join(tmpdir(), "openmuse-db-trim-count-"));
+  try {
+    const db = await createStore({ dataDir: join(root, "pg") });
+    for (let i = 0; i < 12; i++) {
+      await db.put("owner", "activity", { id: `a${i}`, n: i });
+      await new Promise((r) => setTimeout(r, 2));
+    }
+    const before = (await db.list("owner", "activity")).length;
+    const removed = await db.trimOlderThan("owner", "activity", 4);
+    const after = (await db.list("owner", "activity")).length;
+    assert.equal(removed, before - after, "the count must match the rows deleted");
+    assert.equal(after, 4);
+    await db.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("trimOlderThan survives a keep that is not a number", async () => {
+  // Math.min/max propagate NaN, and a NaN bound reaches PGlite as the string
+  // "NaN" and throws. Before the guard, that throw was caught by trimHistory,
+  // which then returned — silently disabling housekeeping for every remaining
+  // owner and kind while the logs looked healthy.
+  const root = await mkdtemp(join(tmpdir(), "openmuse-db-trim-nan-"));
+  try {
+    const db = await createStore({ dataDir: join(root, "pg") });
+    for (let i = 0; i < 6; i++) {
+      await db.put("owner", "run-events", { id: `e${i}` });
+      await new Promise((r) => setTimeout(r, 2));
+    }
+    // NaN falls back to the ceiling, which is above the row count: a trim that
+    // cannot decide how much to keep must keep everything, never delete some.
+    assert.equal(await db.trimOlderThan("owner", "run-events", Number.NaN), 0);
+    assert.equal((await db.list("owner", "run-events")).length, 6);
+    // Both infinities take the same default rather than a clamp: neither is a
+    // finite number, and "+Infinity keeps everything" is the reading that cannot
+    // destroy a log. (Only a *finite* bound is clamped, so -Infinity is 10_000
+    // here, not 1 — failing safe in the direction of keeping rows.)
+    assert.equal(await db.trimOlderThan("owner", "run-events", Number.POSITIVE_INFINITY), 0);
+    assert.equal((await db.list("owner", "run-events")).length, 6);
+    assert.equal(await db.trimOlderThan("owner", "run-events", Number.NEG_INFINITY), 0);
+    assert.equal((await db.list("owner", "run-events")).length, 6);
+    // A finite zero clamps to 1: at least one row must survive.
+    assert.equal(await db.trimOlderThan("owner", "run-events", 0), 5);
+    assert.equal((await db.list("owner", "run-events")).length, 1);
+    // A fractional keep floors rather than erroring on a bigint cast.
+    assert.equal(await db.trimOlderThan("owner", "run-events", 3.7), 0);
+    assert.equal((await db.list("owner", "run-events")).length, 1);
+    await db.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("trimOlderThan reports nothing to delete when it is already bounded", async () => {
+  // The early-return path: a keep at or above the row count deletes nothing and
+  // says so, rather than reporting a negative or invented number.
+  const root = await mkdtemp(join(tmpdir(), "openmuse-db-trim-bounded-"));
+  try {
+    const db = await createStore({ dataDir: join(root, "pg") });
+    for (let i = 0; i < 3; i++) {
+      await db.put("owner", "activity", { id: `a${i}` });
+      await new Promise((r) => setTimeout(r, 2));
+    }
+    assert.equal(await db.trimOlderThan("owner", "activity", 3), 0);
+    assert.equal(await db.trimOlderThan("owner", "activity", 100), 0);
+    assert.equal(await db.trimOlderThan("missing", "activity", 1), 0);
+    assert.equal((await db.list("owner", "activity")).length, 3);
     await db.close();
   } finally {
     await rm(root, { recursive: true, force: true });
