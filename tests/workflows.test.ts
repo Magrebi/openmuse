@@ -25,6 +25,8 @@ before(async () => {
     allowedOrigins: [],
     casaosApiUrl: "http://192.168.4.27",
     casaosProtectedApps: ["openmuse", "tailscale", "casaos"],
+    casaosSelfApps: [],
+    casaosLogToModel: true,
   });
   await server.workspace.ensureSample(owner, server.actions);
 });

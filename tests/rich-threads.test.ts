@@ -24,6 +24,8 @@ before(async () => {
     allowedOrigins: ["http://localhost:8081"],
     casaosApiUrl: "http://192.168.4.27",
     casaosProtectedApps: ["openmuse", "tailscale", "casaos"],
+    casaosSelfApps: [],
+    casaosLogToModel: true,
     intelligenceApiKey: "test-project-key-never-sent",
   }));
   const session = await app.request("/api/session", {

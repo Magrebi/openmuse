@@ -41,6 +41,8 @@ export async function browserFixture(
     allowedOrigins: [],
     casaosApiUrl: "http://192.168.4.27",
     casaosProtectedApps: ["openmuse", "tailscale", "casaos"],
+    casaosSelfApps: [],
+    casaosLogToModel: true,
     workerUrl: `http://127.0.0.1:${address.port}`,
     workerToken: "test-worker-token-at-least-32-characters",
   };

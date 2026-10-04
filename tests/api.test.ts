@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -34,6 +35,8 @@ before(async () => {
     allowedOrigins: ["http://localhost:8081"],
     casaosApiUrl: "http://192.168.4.27",
     casaosProtectedApps: ["openmuse", "tailscale", "casaos"],
+    casaosSelfApps: [],
+    casaosLogToModel: true,
   };
   ({ app, agent } = await createApp(db, config));
   const response = await app.request("/api/session", {
@@ -47,6 +50,66 @@ before(async () => {
 after(async () => {
   await db.close();
   await rm(directory, { recursive: true, force: true });
+});
+
+test("L1: expired sessions are collected on sign-in instead of accumulating forever", async () => {
+  // Nothing used to delete a session row, so every sign-in left a
+  // bearer-token digest behind permanently, long past its 24 hour expiry.
+  const digest = (value: string) => createHash("sha256").update(value).digest("hex");
+  const dead = "a-token-that-expired-yesterday";
+  await db.put("system", "sessions", {
+    id: digest(dead),
+    owner: "local-user",
+    expiresAt: Date.now() - 1,
+  });
+  // A neighbour that shares the word but not the owner+kind pair being swept.
+  await db.put("another-owner", "sessions", {
+    id: "not-ours",
+    expiresAt: Date.now() - 1,
+  });
+
+  const response = await app.request("/api/session", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{}",
+  });
+  assert.equal(response.status, 200);
+  const fresh = (await response.json()).token as string;
+
+  assert.ok(
+    !(await db.get("system", "sessions", digest(dead))),
+    "signing in collects sessions that already lapsed",
+  );
+  assert.ok(await db.get("system", "sessions", digest(fresh)), "the session just created is kept");
+  assert.ok(await db.get("another-owner", "sessions", "not-ours"), "another owner is never swept");
+  assert.equal(
+    (await app.request("/api/workspace", { headers: { Authorization: `Bearer ${fresh}` } })).status,
+    200,
+    "and the fresh session still authenticates",
+  );
+});
+
+test("L1: presenting an expired session token returns 401 and removes the row", async () => {
+  const digest = (value: string) => createHash("sha256").update(value).digest("hex");
+  const dead = "a-token-that-expired-a-minute-ago";
+  await db.put("system", "sessions", {
+    id: digest(dead),
+    owner: "local-user",
+    expiresAt: Date.now() - 1,
+  });
+  assert.ok(
+    await db.get("system", "sessions", digest(dead)),
+    "the lapsed row exists to begin with",
+  );
+
+  const response = await app.request("/api/workspace", {
+    headers: { Authorization: `Bearer ${dead}` },
+  });
+  assert.equal(response.status, 401, "an expired token is still refused");
+  assert.ok(
+    !(await db.get("system", "sessions", digest(dead))),
+    "a rejected token leaves no row behind",
+  );
 });
 
 test("API protects private data and rejects unrelated web origins", async () => {

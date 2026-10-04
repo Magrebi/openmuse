@@ -16,6 +16,8 @@ export const config: Config = {
   allowedOrigins: [],
   casaosApiUrl: "http://192.168.4.27",
   casaosProtectedApps: ["openmuse", "tailscale", "casaos"],
+  casaosSelfApps: [],
+  casaosLogToModel: true,
   computerEnabled: true,
 };
 export const ok = (stdout = ""): DockerResult => ({

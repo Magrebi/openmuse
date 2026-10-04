@@ -51,6 +51,8 @@ test("CopilotKit model worker executes server tools and persists the confirmed o
       allowedOrigins: [],
       casaosApiUrl: "http://192.168.4.27",
       casaosProtectedApps: ["openmuse", "tailscale", "casaos"],
+      casaosSelfApps: [],
+      casaosLogToModel: true,
       computerEnabled: true,
     },
     { docker: computerFixture().runner },
@@ -149,6 +151,8 @@ test("the model worker keeps the text a model replies with when it calls no tool
     allowedOrigins: [],
     casaosApiUrl: "http://192.168.4.27",
     casaosProtectedApps: ["openmuse", "tailscale", "casaos"],
+    casaosSelfApps: [],
+    casaosLogToModel: true,
   });
   try {
     const task = await server.agent.createTask("owner", { prompt: "Plan my week" });
@@ -195,6 +199,8 @@ test("replaying a completed prepared action returns its receipt without reopenin
     allowedOrigins: [],
     casaosApiUrl: "http://192.168.4.27",
     casaosProtectedApps: ["openmuse", "tailscale", "casaos"],
+    casaosSelfApps: [],
+    casaosLogToModel: true,
   });
   try {
     const task = await server.agent.createTask("replay-owner", {

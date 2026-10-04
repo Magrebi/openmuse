@@ -6,6 +6,7 @@ import {
   browserWorkerUrl,
   type Config,
   shadowedEnvKeys,
+  warnAboutCasaOSProtection,
 } from "../apps/server/src/config.ts";
 
 const sampleConfig: Config = {
@@ -19,6 +20,8 @@ const sampleConfig: Config = {
   allowedOrigins: ["http://localhost:8081"],
   casaosApiUrl: "http://192.168.4.27",
   casaosProtectedApps: ["openmuse", "tailscale", "casaos"],
+  casaosSelfApps: [],
+  casaosLogToModel: true,
 };
 
 function liveConfig(intelligenceApiKey?: string): Config {
@@ -121,4 +124,33 @@ test("environment variables that override a different .env value are reported by
   const env = { OPENAI_API_KEY: "sk-proj-system", MODEL: "openai/gpt-5", EMPTY: "set" };
   assert.deepEqual(shadowedEnvKeys(file, env), ["OPENAI_API_KEY", "EMPTY"]);
   assert.deepEqual(shadowedEnvKeys(file, {}), []);
+});
+
+// ---------------------------------------------------------------------------
+// M2: the startup warning that points at the naming gap in the app guard.
+// ---------------------------------------------------------------------------
+
+test("M2: a CasaOS deployment without a self-app declaration is warned at startup", (t) => {
+  const logged = t.mock.method(console, "warn", () => {});
+  const configured: Config = { ...sampleConfig, casaosSelfApps: [] };
+  const warnings = warnAboutCasaOSProtection(configured);
+  assert.equal(warnings.length, 1, "the gap is reported");
+  assert.match(warnings[0], /CASAOS_SELF_APPS/);
+  assert.equal(logged.mock.callCount(), 1, "and it reaches the operator's console");
+});
+
+test("M2: declaring self apps silences the warning", (t) => {
+  const logged = t.mock.method(console, "warn", () => {});
+  const declared: Config = { ...sampleConfig, casaosSelfApps: ["openmuse"] };
+  assert.deepEqual(warnAboutCasaOSProtection(declared), []);
+  assert.equal(logged.mock.callCount(), 0, "a correctly declared deployment stays quiet");
+});
+
+test("M2: a deployment that does not use CasaOS is never warned", (t) => {
+  const logged = t.mock.method(console, "warn", () => {});
+  // No CASAOS_API_URL means the operator is not using the integration at all,
+  // so nagging about its app protection would be noise on every startup.
+  const unused: Config = { ...sampleConfig, casaosApiUrl: "", casaosSelfApps: [] };
+  assert.deepEqual(warnAboutCasaOSProtection(unused), []);
+  assert.equal(logged.mock.callCount(), 0);
 });

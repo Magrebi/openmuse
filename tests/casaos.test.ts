@@ -17,6 +17,7 @@ import {
   clearCasaOSTokenCache,
   MAX_LINE_CHARS,
   redactCasaOSLogs,
+  summarizeCasaOSLogs,
   truncateToTail,
   verifyCasaOSLogin,
 } from "../apps/server/src/casaos.ts";
@@ -102,6 +103,8 @@ interface MockState {
   loginStatus?: number;
   putBehavior?: "ok" | "timeout" | "500";
   logsData?: string;
+  /** Access token handed back by the login fixture (L4 needs a real JWT shape). */
+  loginToken?: string;
 }
 
 function mockState(): MockState {
@@ -120,7 +123,9 @@ function casaOSMock(state: MockState) {
       return json(200, {
         success: 200,
         message: "ok",
-        data: { token: { access_token: "test-token", refresh_token: "rt" } },
+        data: {
+          token: { access_token: state.loginToken ?? "test-token", refresh_token: "rt" },
+        },
       });
     }
     if (u.pathname === "/v2/app_management/web/appgrid") {
@@ -165,6 +170,10 @@ function testClient(owner: string, connectionId = "c1") {
     baseUrl: "http://127.0.0.1",
     owner,
     loadCredentials: async () => ({ username: "u", password: "p", connectionId }),
+    // These tests assert on log TEXT (tail ordering, caps, redaction markers).
+    // M3 makes raw text opt-in, so the shared helper enables it; the default-off
+    // shape summary has its own tests below.
+    logToModel: true,
   });
 }
 
@@ -200,6 +209,8 @@ before(async () => {
     encryptionKey: ENCRYPTION_KEY,
     casaosApiUrl: "http://127.0.0.1",
     casaosProtectedApps: ["openmuse", "tailscale", "casaos"],
+    casaosSelfApps: [],
+    casaosLogToModel: true,
   };
   ({ app } = await createApp(db, config));
   const response = await app.request("/api/session", {
@@ -2166,4 +2177,290 @@ test("listApps maps a missing status key to unknown without throwing", async () 
   assert.equal(apps.length, 3);
   assert.equal(apps.find((a) => a.name === "mystery")?.status, "unknown");
   assert.equal(apps.find((a) => a.name === "handbrake")?.status, "exited");
+});
+
+// ---------------------------------------------------------------------------
+// Security fixes: M1 (no default URL), M2 (self-apps guard), M3 (log shape).
+// ---------------------------------------------------------------------------
+
+test("M1: an unset CASAOS_API_URL fails closed and names the variable", () => {
+  // The old code fell back to http://192.168.4.27, which both disclosed one
+  // operator's LAN topology and aimed the password at a DHCP-reassignable IP.
+  const err = (() => {
+    try {
+      assertCasaOSUrlAllowed("", false);
+      return null;
+    } catch (e) {
+      return e as AppError;
+    }
+  })();
+  assert.ok(err, "an empty URL must be rejected");
+  assert.match(err.message, /CASAOS_API_URL is not set/);
+  assert.equal(err.status, 503);
+  // Whitespace-only is the same mistake and must not reach new URL().
+  assert.throws(() => assertCasaOSUrlAllowed("   ", false), /CASAOS_API_URL is not set/);
+});
+
+test("M2: an app declared in CASAOS_SELF_APPS is refused under any built-in list", () => {
+  const builtIn = ["openmuse", "tailscale", "casaos"];
+  // The gap being closed: an install named "muse" matches nothing built in.
+  assert.doesNotThrow(() => assertCasaOSAppAllowed(builtIn, "muse"));
+  assert.throws(
+    () => assertCasaOSAppAllowed(builtIn, "muse", ["muse"]),
+    /protected/,
+    "a self-declared app is refused",
+  );
+  // Case and surrounding whitespace are normalized, like the built-in path.
+  assert.throws(() => assertCasaOSAppAllowed(builtIn, "  Muse  ", ["muse"]), /protected/);
+  assert.throws(() => assertCasaOSAppAllowed(builtIn, "MUSE", ["muse"]), /protected/);
+  // The built-in protections are unchanged, and an unrelated app still passes.
+  assert.throws(() => assertCasaOSAppAllowed(builtIn, "openmuse", []), /protected/);
+  assert.throws(() => assertCasaOSAppAllowed(builtIn, "openmuse-extra", []), /protected/);
+  assert.doesNotThrow(() => assertCasaOSAppAllowed(builtIn, "plex", ["muse"]));
+});
+
+test("M3: appLogs returns a shape summary and no text unless opted in", async () => {
+  const state = mockState();
+  // A secret in a format the redactor cannot know about — exactly the M3 case.
+  const secret = "Zx9-NotA-Known-Token-Format-Value";
+  state.logsData = [
+    "starting up",
+    `connecting with MY_CUSTOM_KEY ${secret}`,
+    "ERROR: could not bind port",
+    "warning: disk almost full",
+    "recovered",
+  ].join("\n");
+  fetchHandler = casaOSMock(state);
+
+  const client = new CasaOSClient({
+    baseUrl: "http://127.0.0.1",
+    owner: "shape-default",
+    loadCredentials: async () => ({ username: "u", password: "p", connectionId: "c1" }),
+    // logToModel intentionally omitted: the default must be safe.
+  });
+  const result = await client.appLogs("plex");
+
+  assert.deepEqual(result.lines, [], "no log text is returned by default");
+  const summary = result.summary;
+  assert.ok(summary, "a shape summary is returned instead");
+  assert.equal(summary.lineCount, 5);
+  assert.equal(summary.levels.error, 1);
+  assert.equal(summary.levels.warning, 1);
+  // 1-based line numbers of the error and warning lines.
+  assert.deepEqual(summary.notableLines, [3, 4]);
+  assert.equal(summary.truncated, false);
+  // The decisive assertion: nothing from the log body may appear anywhere in
+  // the serialized result, including in the summary fields.
+  const serialized = JSON.stringify(result);
+  assert.ok(!serialized.includes(secret), `log text leaked to the model: ${serialized}`);
+  assert.ok(!serialized.includes("starting up"), "line content leaked");
+  assert.ok(!serialized.includes("could not bind port"), "error text leaked");
+});
+
+test("M3: CASAOS_LOG_TO_MODEL=true restores redacted text", async () => {
+  const state = mockState();
+  state.logsData = "plain line stays\npassword=hunter2\nERROR: boom";
+  fetchHandler = casaOSMock(state);
+  const client = new CasaOSClient({
+    baseUrl: "http://127.0.0.1",
+    owner: "shape-optin",
+    loadCredentials: async () => ({ username: "u", password: "p", connectionId: "c1" }),
+    logToModel: true,
+  });
+  const result = await client.appLogs("plex");
+  assert.equal(result.summary, undefined);
+  assert.equal(result.lines.length, 3);
+  assert.ok(!result.lines.join("\n").includes("hunter2"), "still redacted when opted in");
+});
+
+test("M3: summarizeCasaOSLogs reports counts only and never any line content", () => {
+  const summary = summarizeCasaOSLogs([
+    "INFO all good",
+    "Error: token abc123 rejected",
+    "FATAL cannot continue",
+    "errors are plural", // "errors" must not count as the "error" token
+  ]);
+  assert.equal(summary.lineCount, 4);
+  // "error" counts only the whole-word line 2; "errors" on line 4 does not.
+  assert.equal(summary.levels.error, 1);
+  assert.equal(summary.levels.fatal, 1);
+  assert.deepEqual(summary.notableLines, [2, 3]);
+  assert.ok(!JSON.stringify(summary).includes("abc123"), "no content is included");
+});
+
+// ---------------------------------------------------------------------------
+// L4: the token cache honours an expiry instead of holding a JWT indefinitely.
+// ---------------------------------------------------------------------------
+
+/** Build a JWT-shaped token whose `exp` is `secondsFromNow` from the clock. */
+function jwtExpiringAt(secondsFromNow: number): string {
+  const header = Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" })).toString("base64url");
+  const payload = Buffer.from(
+    JSON.stringify({ exp: Math.floor(Date.now() / 1000) + secondsFromNow }),
+  ).toString("base64url");
+  return `${header}.${payload}.signature`;
+}
+
+test("L4: an expired cached token triggers a fresh login without waiting for a 401", async () => {
+  const state = mockState();
+  state.loginToken = jwtExpiringAt(-60); // already expired
+  fetchHandler = casaOSMock(state);
+  const client = new CasaOSClient({
+    baseUrl: "http://127.0.0.1",
+    owner: "ttl-expired",
+    loadCredentials: async () => ({ username: "u", password: "p", connectionId: "c1" }),
+  });
+
+  await client.listApps(true);
+  const afterFirst = state.logins.length;
+  assert.equal(afterFirst, 1, "the first call logs in");
+  await client.listApps(true);
+  assert.equal(
+    state.logins.length,
+    afterFirst + 1,
+    "the second call re-authenticates rather than reusing the expired token",
+  );
+  // The mock never returns a 401 on the appgrid: the expiry alone drove the
+  // re-login, which is the point of L4.
+  assert.equal(state.logins.length, 2, "exactly one extra login, no retry storm");
+});
+
+test("L4: a token that is still valid is reused, so the TTL adds no churn", async () => {
+  const state = mockState();
+  state.loginToken = jwtExpiringAt(3600);
+  fetchHandler = casaOSMock(state);
+  const client = new CasaOSClient({
+    baseUrl: "http://127.0.0.1",
+    owner: "ttl-valid",
+    loadCredentials: async () => ({ username: "u", password: "p", connectionId: "c1" }),
+  });
+  await client.listApps(true);
+  await client.listApps(true);
+  await client.listApps(true);
+  assert.equal(state.logins.length, 1, "a valid token is served from cache");
+});
+
+test("L4: an opaque, non-JWT token still gets a bounded cache lifetime", async () => {
+  // CasaOS returns a JWT, but a proxy or a future version might not. Such a
+  // token must still be cached (no per-call login) and must not throw.
+  const state = mockState();
+  state.loginToken = "opaque-token-value";
+  fetchHandler = casaOSMock(state);
+  const client = new CasaOSClient({
+    baseUrl: "http://127.0.0.1",
+    owner: "ttl-opaque",
+    loadCredentials: async () => ({ username: "u", password: "p", connectionId: "c1" }),
+  });
+  await client.listApps(true);
+  await client.listApps(true);
+  assert.equal(state.logins.length, 1, "an opaque token is reused within its TTL");
+});
+
+test("L4: a JWT-shaped token whose payload is garbage is cached, not fatal", async () => {
+  const state = mockState();
+  state.loginToken = "aaa.!!!not-base64!!!.ccc";
+  fetchHandler = casaOSMock(state);
+  const client = new CasaOSClient({
+    baseUrl: "http://127.0.0.1",
+    owner: "ttl-garbage",
+    loadCredentials: async () => ({ username: "u", password: "p", connectionId: "c1" }),
+  });
+  const apps = await client.listApps(true);
+  assert.equal(apps.length, 4, "an unparseable payload does not break the read");
+});
+
+// ---------------------------------------------------------------------------
+// L3: the post-PUT poll converges, and says so when it does not.
+// ---------------------------------------------------------------------------
+
+/** Count appgrid reads so a test can prove the loop stopped early. */
+function pollCountingAppgrid(statusFor: (call: number) => string) {
+  const state = mockState();
+  const calls = { appgrid: 0 };
+  fetchHandler = async (url: string, init: RequestInit): Promise<Response> => {
+    const u = new URL(url);
+    if (u.pathname === "/v1/users/login")
+      return json(200, { data: { token: { access_token: "test-token" } } });
+    if (u.pathname === "/v2/app_management/compose/plex/status" && init.method === "PUT")
+      return json(200, { message: "compose app status is being changed asynchronously" });
+    if (u.pathname === "/v2/app_management/web/appgrid") {
+      calls.appgrid += 1;
+      return json(200, {
+        data: [
+          { name: "plex", status: statusFor(calls.appgrid) },
+          { name: "openmuse", status: "running" },
+        ],
+      });
+    }
+    throw new Error(`unexpected ${init.method} ${u.pathname}`);
+  };
+  return { state, calls };
+}
+
+async function executeStop(owner: string) {
+  clearCasaOSTokenCache(owner);
+  await saveCasaOSCredentials(db, config, owner, "admin", "right-password");
+  const creds = await loadCasaOSCredentials(db, config, owner);
+  const workspace = testWorkspace(db, config);
+  return workspace.execute(
+    owner,
+    { kind: "casaos.action", data: { app: "plex", action: "stop" } },
+    creds?.connectionId,
+  );
+}
+
+test("L3: the poll stops as soon as the requested state is observed", async () => {
+  // The app is already "exited" on the first poll after validateApp's read, so
+  // the loop must not spend its remaining ~7s waiting for a state it has seen.
+  const { calls } = pollCountingAppgrid(() => "exited");
+  const result = await executeStop("l3-converged");
+  assert.match(result, /Stop of "plex" was requested on CasaOS/);
+  assert.match(result, /Current status: exited\./);
+  assert.ok(
+    !/expected "exited"/.test(result),
+    "a converged poll must not be reported as a mismatch",
+  );
+  // One appgrid read for validateApp plus exactly one for the poll.
+  assert.ok(calls.appgrid <= 2, `expected an early exit, saw ${calls.appgrid} appgrid reads`);
+});
+
+test("L3: a status contradicting the requested action is called out explicitly", async () => {
+  // The user approved "Stop Plex" and the app is still running. The old message
+  // reported "Current status: running" with nothing marking the contradiction.
+  const { calls } = pollCountingAppgrid(() => "running");
+  const result = await executeStop("l3-mismatch");
+  assert.match(result, /Current status: running/);
+  assert.match(
+    result,
+    /expected "exited" after this change/,
+    "the mismatch is stated, not just implied",
+  );
+  // Having exhausted the loop rather than converged, it must have polled fully.
+  assert.equal(calls.appgrid, 4, "validateApp plus all three polls");
+});
+
+test("M2: execution refuses a self-declared app even when the built-in list misses it", async () => {
+  // End-to-end through workspace.execute, which re-checks the guard at execution
+  // time: a "muse" install is refused when declared, allowed when not.
+  const selfDeclared: Config = { ...config, casaosSelfApps: ["muse"] };
+  const owner = "m2-selfapp";
+  clearCasaOSTokenCache(owner);
+  await saveCasaOSCredentials(db, selfDeclared, owner, "admin", "right-password");
+  const creds = await loadCasaOSCredentials(db, selfDeclared, owner);
+  const workspace = testWorkspace(db, selfDeclared);
+
+  const refused = await workspace
+    .execute(
+      owner,
+      { kind: "casaos.action", data: { app: "muse", action: "stop" } },
+      creds?.connectionId,
+    )
+    .catch((e: Error) => e);
+  assert.match(String((refused as Error).message), /protected/);
+
+  // The same app under a config that does not declare it is not blocked by this
+  // guard — the check is exactly as narrow as the operator's declaration.
+  assert.doesNotThrow(() =>
+    assertCasaOSAppAllowed(config.casaosProtectedApps, "muse", config.casaosSelfApps),
+  );
 });
