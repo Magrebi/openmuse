@@ -49,6 +49,61 @@ export class Store {
     );
     return result.rows.map((row) => row.data as T);
   }
+  /**
+   * Full-text search over a set of string fields inside `data`.
+   *
+   * Each word must appear somewhere in the concatenated fields, which is the
+   * same rule the JavaScript filter applied. Doing it here means a search does
+   * not pull every stored record's body into memory first.
+   */
+  async searchText<T = Record<string, unknown>>(
+    owner: string,
+    kind: string,
+    fields: readonly string[],
+    words: readonly string[],
+    options: { excludePattern?: { field: string; pattern: string }; order?: "date_desc" } = {},
+  ): Promise<T[]> {
+    // An empty query matches nothing, not everything.
+    if (!words.length) return [];
+    const params: unknown[] = [owner, kind];
+    // A jsonb key cannot be a bind parameter, so each field name is validated
+    // against an identifier pattern instead of being interpolated blindly. Every
+    // *value*, including the exclusion pattern, is always bound.
+    const fieldRef = (field: string) => {
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(field))
+        throw new Error(`Invalid search field: ${field}`);
+      params.push(field);
+      // The cast is required: Postgres cannot infer the type of a bare
+      // parameter used as a jsonb key, and would reject the query.
+      return `data->>(${`$${params.length}`}::text)`;
+    };
+    const haystack = fields.map((field) => `coalesce(${fieldRef(field)},'')`).join(" || ' ' || ");
+    // One ILIKE term per word, ANDed: every word must appear somewhere.
+    const terms = words.map((word) => {
+      params.push(`%${word.toLowerCase()}%`);
+      return `(${haystack}) ILIKE ($${params.length}::text)`;
+    });
+    // `coalesce` mirrors the old JavaScript, which read a missing label as "".
+    const exclude = options.excludePattern
+      ? (() => {
+          params.push(options.excludePattern.pattern);
+          // Capture the placeholder *before* fieldRef pushes the key, otherwise
+          // the two get numbered against each other and Postgres sees an
+          // unreferenced parameter.
+          const pattern = `$${params.length}::text`;
+          return `coalesce(${fieldRef(options.excludePattern.field)},'') !~* (${pattern})`;
+        })()
+      : undefined;
+    const order =
+      options.order === "date_desc"
+        ? "ORDER BY data->>'date' DESC,id DESC"
+        : "ORDER BY data->>'date' ASC,id ASC";
+    const result = await this.db.query(
+      `SELECT data FROM records WHERE ${["owner=$1", "kind=$2", ...(exclude ? [exclude] : []), ...terms].join(" AND ")} ${order}`,
+      params,
+    );
+    return result.rows.map((row) => row.data as T);
+  }
   async put<T extends { id: string }>(owner: string, kind: string, value: T): Promise<T> {
     await this.db.query(
       "INSERT INTO records(owner,kind,id,data) VALUES($1,$2,$3,$4::jsonb) ON CONFLICT(owner,kind,id) DO UPDATE SET data=excluded.data,updated_at=now()",

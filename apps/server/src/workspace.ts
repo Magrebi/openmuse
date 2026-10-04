@@ -72,10 +72,17 @@ export class WorkspaceService {
     const connection = await this.connection(owner);
     if (!connection) return [];
     if (this.config.mode === "live") return this.google(owner, connection.id).listEvents(options);
-    return (await this.db.list<CalendarEvent>(owner, "events"))
+    // One calendar's events, narrowed in the database; the time window is then
+    // applied to that set rather than to every event the owner has.
+    const scoped = await this.db.listWhere<CalendarEvent>(
+      owner,
+      "events",
+      "calendarId",
+      options.calendarId ?? "primary",
+    );
+    return scoped
       .filter(
         (event) =>
-          event.calendarId === (options.calendarId ?? "primary") &&
           (!options.timeMax || Date.parse(event.start) < Date.parse(options.timeMax)) &&
           (!options.timeMin || Date.parse(event.end) > Date.parse(options.timeMin)),
       )
@@ -121,17 +128,14 @@ export class WorkspaceService {
         connection.id,
       );
     const words = query.toLowerCase().trim().split(/\s+/).filter(Boolean);
-    return (await this.db.list<Mail>(owner, "mail"))
-      .filter(
-        (message) =>
-          !/^Sent\b/i.test(message.label) &&
-          words.every((word) =>
-            `${message.sender} ${message.from} ${message.subject} ${message.body}`
-              .toLowerCase()
-              .includes(word),
-          ),
-      )
-      .sort((a, b) => b.date.localeCompare(a.date));
+    // Matched in the database. Sample mode appends to `mail` on every approved
+    // send, so this collection is not the fixed fixture it looks like.
+    // `\y` is Postgres' word boundary; `\b` is not one there and would silently
+    // match nothing, putting sent mail back into search results.
+    return this.db.searchText<Mail>(owner, "mail", ["sender", "from", "subject", "body"], words, {
+      excludePattern: { field: "label", pattern: "^Sent\\y" },
+      order: "date_desc",
+    });
   }
   async ensureSample(owner: string, actions: ActionService) {
     if (this.config.mode !== "sample") return;

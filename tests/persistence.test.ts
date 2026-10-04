@@ -88,6 +88,110 @@ test("listWhere returns only matching records, in the order the caller expects",
   }
 });
 
+test("searchText matches the rule the in-memory filter used, and honours ordering", async () => {
+  const root = await mkdtemp(join(tmpdir(), "openmuse-db-search-"));
+  try {
+    const db = await createStore({ dataDir: join(root, "pg") });
+    await db.put("owner", "mail", {
+      id: "m1",
+      sender: "Aqua Tours",
+      from: "bookings@aquatours.example",
+      subject: "Trip confirmation",
+      body: "The aquarium visit is confirmed.",
+      label: "Inbox",
+      date: "2026-02-01T00:00:00.000Z",
+    });
+    await db.put("owner", "mail", {
+      id: "m2",
+      sender: "You",
+      subject: "Re: Trip confirmation",
+      body: "sent copy",
+      label: "Sent · local",
+      date: "2026-03-01T00:00:00.000Z",
+    });
+    await db.put("owner", "mail", {
+      id: "m3",
+      sender: "Studio",
+      subject: "Design review",
+      body: "unrelated",
+      label: "Inbox",
+      date: "2026-01-01T00:00:00.000Z",
+    });
+
+    const mail = () =>
+      db.searchText<{ id: string }>(
+        "owner",
+        "mail",
+        ["sender", "from", "subject", "body"],
+        ["trip"],
+        { excludePattern: { field: "label", pattern: "^Sent\\y" }, order: "date_desc" },
+      );
+
+    // "trip" appears in a subject and a body; the Sent copy is excluded.
+    assert.deepEqual(
+      (await mail()).map((row) => row.id),
+      ["m1"],
+    );
+    // Every word must match, and a word can come from any of the fields.
+    assert.deepEqual(
+      (
+        await db.searchText<{ id: string }>(
+          "owner",
+          "mail",
+          ["sender", "from", "subject", "body"],
+          ["aqua", "aquarium"],
+        )
+      ).map((row) => row.id),
+      ["m1"],
+    );
+    // A word that appears nowhere matches nothing.
+    assert.deepEqual(
+      (
+        await db.searchText<{ id: string }>(
+          "owner",
+          "mail",
+          ["sender", "from", "subject", "body"],
+          ["trip", "nonexistentterm"],
+        )
+      ).map((row) => row.id),
+      [],
+    );
+    // An empty query is not "match everything".
+    assert.deepEqual(await db.searchText("owner", "mail", ["subject"], []), []);
+
+    // Regression guard for a trap this move introduced: Postgres' `\b` is not a
+    // word boundary, so `^Sent\b` matches nothing and sent mail leaks back into
+    // results. `\y` is the equivalent and must behave like the JS regex did.
+    for (const label of ["Sent · local", "Sent", "Inbox", "Sentry"]) {
+      await db.put("owner", "labels", { id: label, label, body: "shared token" });
+    }
+    // Every row matches the term, so only the exclusion decides the result.
+    const excluded = await db.searchText<{ label: string }>(
+      "owner",
+      "labels",
+      ["body"],
+      ["shared"],
+      { excludePattern: { field: "label", pattern: "^Sent\\y" } },
+    );
+    assert.deepEqual(
+      excluded.map((row) => row.label).sort(),
+      ["Inbox", "Sentry"],
+      "same labels the JavaScript /^Sent\\b/i filter kept",
+    );
+    // A field name that is not a plain identifier must never reach the query.
+    await assert.rejects(
+      () => db.searchText("owner", "mail", ["subject'); DROP TABLE records;--"], ["x"]),
+      /Invalid search field/,
+    );
+    // The table is still there and its rows intact, so the guard ran before any
+    // statement reached the database.
+    assert.equal((await db.list<{ id: string }>("owner", "mail")).length, 3);
+    await db.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("idle Postgres client errors are logged instead of crashing the process", async (t) => {
   const logged = t.mock.method(console, "error", () => {});
   const pool = createPool("postgres://127.0.0.1:1/openmuse");
