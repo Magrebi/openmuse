@@ -232,7 +232,17 @@ fn spawn_logged(
 /// Each is the exact process this app started, never a name or a pattern.
 #[tauri::command]
 fn stop_children(state: tauri::State<'_, Mutex<AppState>>) -> Result<()> {
-    for (_, handle) in state.lock().unwrap().children.drain() {
+    // Drained into a local Vec first, so the app-wide mutex is released before
+    // any child is stopped: `Handle::stop` waits on the child's exit, and holding
+    // the lock across that would stall every other command needing the state.
+    let handles: Vec<proc::Handle> = state
+        .lock()
+        .unwrap()
+        .children
+        .drain()
+        .map(|(_, handle)| handle)
+        .collect();
+    for handle in handles {
         handle.stop();
     }
     Ok(())
@@ -524,13 +534,17 @@ pub fn run() {
             // Exiting signals every child this app started, so no service is
             // left orphaned and no name-matched kill can reach someone else's.
             if let RunEvent::ExitRequested { .. } = event {
-                for (_, handle) in app
+                // Same shape as `stop_children`: the children are taken out
+                // under the lock, and the waits happen with it released.
+                let handles: Vec<proc::Handle> = app
                     .state::<Mutex<AppState>>()
                     .lock()
                     .unwrap()
                     .children
                     .drain()
-                {
+                    .map(|(_, handle)| handle)
+                    .collect();
+                for handle in handles {
                     handle.stop();
                 }
             }
