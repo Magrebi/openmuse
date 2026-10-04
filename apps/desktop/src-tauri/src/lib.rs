@@ -406,7 +406,17 @@ fn set_tray(app: &AppHandle, tone: &str, state: &str, spark: Option<&[f32]>) {
     // the status page can never disagree about which state this is.
     let _ = tray.set_tooltip(Some(format!("OpenMuse — {} ({})", state, tone)));
     if let Some(bars) = spark {
-        let _ = tray.set_icon(Some(spark_icon(bars)));
+        // An idle window must not blank the tray. `spark_icon(&[])` is a fully
+        // transparent 64x64 buffer, which a menu bar renders as no icon at all,
+        // and `set_icon(None)` *removes* the icon rather than restoring the
+        // default one — so the app's own icon goes back, which is the plain icon
+        // the idle state is documented to show.
+        let icon = if bars.is_empty() {
+            app.default_window_icon().cloned()
+        } else {
+            Some(spark_icon(bars))
+        };
+        let _ = tray.set_icon(icon);
     }
 }
 
