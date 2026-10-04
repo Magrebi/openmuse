@@ -83,7 +83,7 @@ export async function createWorkerServer(options: {
         return;
       }
       const match =
-        /^\/sessions\/([^/]+)\/(navigate|close|screenshot|read|snapshot|input|downloads)(?:\/([^/]+))?$/.exec(
+        /^\/sessions\/([^/]+)\/(navigate|close|screenshot|read|snapshot|input|downloads|frame)(?:\/([^/]+))?$/.exec(
           pathname,
         );
       if (!match) throw new WorkerError("NOT_FOUND", "Worker endpoint not found.", 404);
@@ -100,7 +100,21 @@ export async function createWorkerServer(options: {
         json(200, await browser.read(id));
       else if (action === "snapshot" && !downloadId && request.method === "GET")
         json(200, await browser.snapshot(id));
-      else if (action === "screenshot" && !downloadId && request.method === "GET") {
+      else if (action === "frame" && !downloadId && request.method === "GET") {
+        // The cursor rides in headers rather than in the body so the frame stays
+        // a plain JPEG: the caller can hand the bytes to an image decoder and
+        // the position to its own renderer without parsing anything.
+        const frame = await browser.frame(id);
+        response.writeHead(200, {
+          "content-type": "image/jpeg",
+          "content-length": frame.bytes.length,
+          "x-openmuse-cursor-x": String(frame.cursor.x),
+          "x-openmuse-cursor-y": String(frame.cursor.y),
+          "x-openmuse-url": encodeURIComponent(frame.url.slice(0, 512)),
+          "x-openmuse-title": encodeURIComponent(frame.title.slice(0, 256)),
+        });
+        response.end(frame.bytes);
+      } else if (action === "screenshot" && !downloadId && request.method === "GET") {
         const bytes = await browser.screenshot(id);
         response.writeHead(200, { "content-type": "image/png", "content-length": bytes.length });
         response.end(bytes);

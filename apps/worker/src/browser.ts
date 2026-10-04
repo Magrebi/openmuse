@@ -45,6 +45,16 @@ type Running = {
   downloadError?: boolean;
   /** True while a caller-driven tab creation is in flight, so the popup guard adopts it. */
   adopting: boolean;
+  /**
+   * Where the agent's pointer last was.
+   *
+   * Chromium gives no cursor position, so the mirror cannot draw a true cursor;
+   * it draws the last place the agent touched, which for every action that moves
+   * it — a click, an element activation — is exactly where the agent is
+   * working. Tracked here rather than at the server because only the worker
+   * knows which of the two happened.
+   */
+  cursor: { x: number; y: number };
 };
 const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -212,6 +222,28 @@ export function validateInput(input: Record<string, unknown>): BrowserInput {
     return { type: "nav", to };
   throw invalid;
 }
+
+/** One frame of the agent's browser, for the live mirror. */
+export interface Frame {
+  bytes: Buffer;
+  cursor: { x: number; y: number };
+  url: string;
+  title: string;
+}
+
+/**
+ * Quality of a mirrored frame.
+ *
+ * Deliberately low. The mirror exists so a person can see *which page* the
+ * agent is reading, and the alternative to a legible thumbnail at 4fps is a
+ * full-quality screenshot that saturates the worker socket and starves the
+ * agent's own work. 45 is past the point where JPEG artefacts are visible at
+ * the size this renders.
+ */
+const FRAME_QUALITY = 45;
+
+/** A mirrored frame is never larger than this; the codec refuses anything bigger. */
+export const MAX_FRAME_BYTES = 512 * 1024;
 
 export async function createBrowserManager(options: {
   dataDir: string;
@@ -439,6 +471,27 @@ export async function createBrowserManager(options: {
   }
 
   /**
+   * Move the mirror's cursor to the element an action just touched.
+   *
+   * Best-effort by design: an element that has been replaced since the snapshot,
+   * or one scrolled out of the viewport, leaves the cursor where it was. That is a
+   * cosmetic inaccuracy in a watch-only stream, and it must never be allowed to
+   * fail the action that was already performed.
+   */
+  async function moveCursorTo(page: Page, instance: Running, ref: string) {
+    try {
+      const box = await (await locate(page, ref)).boundingBox();
+      if (!box) return;
+      instance.cursor = {
+        x: Math.max(0, Math.min(SCREEN_WIDTH, Math.round(box.x + box.width / 2))),
+        y: Math.max(0, Math.min(SCREEN_HEIGHT, Math.round(box.y + box.height / 2))),
+      };
+    } catch {
+      /* The element is gone; the cursor stays where it was. */
+    }
+  }
+
+  /**
    * Lets a page finish arriving before the next action. Real pages fetch and render after
    * the click that triggered them, so acting immediately is the main cause of a
    * mis-read. A timeout is reported as a normal failure rather than thrown raw, so the
@@ -619,6 +672,7 @@ export async function createBrowserManager(options: {
         touched: Date.now(),
         pending: new Set(),
         adopting: true,
+        cursor: { x: SCREEN_WIDTH / 2, y: SCREEN_HEIGHT / 2 },
       };
       running.set(id, instance);
       const page = await context.newPage();
@@ -822,20 +876,57 @@ export async function createBrowserManager(options: {
     },
     input: (id: string, input: Record<string, unknown>) =>
       serial(id, async () => {
-        const page = pageOf(active(id));
+        const instance = active(id);
+        const page = pageOf(instance);
         const action = validateInput(input);
-        if (action.type === "click") await page.mouse.click(action.x, action.y);
-        else if (action.type === "text") await page.keyboard.insertText(action.text);
+        if (action.type === "click") {
+          await page.mouse.click(action.x, action.y);
+          instance.cursor = { x: action.x, y: action.y };
+        } else if (action.type === "text") await page.keyboard.insertText(action.text);
         else if (action.type === "key") await page.keyboard.press(action.key);
         else if (action.type === "scroll") await page.mouse.wheel(0, action.deltaY);
-        else if (action.type === "activate") await activate(page, action.ref);
-        else if (action.type === "fill") await fill(page, action.ref, action.text);
-        else if (action.type === "select") await selectOption(page, action.ref, action.value);
-        else if (action.type === "check") await check(page, action.ref, action.checked);
-        else if (action.type === "upload") await upload(page, id, action.ref, action.file);
-        else if (action.type === "wait") await waitFor(page, action);
+        else if (action.type === "activate") {
+          await activate(page, action.ref);
+          await moveCursorTo(page, instance, action.ref);
+        } else if (action.type === "fill") {
+          await fill(page, action.ref, action.text);
+          await moveCursorTo(page, instance, action.ref);
+        } else if (action.type === "select") {
+          await selectOption(page, action.ref, action.value);
+          await moveCursorTo(page, instance, action.ref);
+        } else if (action.type === "check") {
+          await check(page, action.ref, action.checked);
+          await moveCursorTo(page, instance, action.ref);
+        } else if (action.type === "upload") {
+          await upload(page, id, action.ref, action.file);
+          await moveCursorTo(page, instance, action.ref);
+        } else if (action.type === "wait") await waitFor(page, action);
         else await go(page, action.to);
         return refresh(id);
+      }),
+    /**
+     * One frame of the live mirror.
+     *
+     * Serialised on the session queue like every other operation, which is what
+     * keeps a mirror at 4fps from interleaving with the action the person is
+     * watching. A frame that cannot be taken is an error the caller drops, not a
+     * failure of the mirror: the agent's own work is unaffected either way.
+     */
+    frame: (id: string) =>
+      serial(id, async () => {
+        const instance = active(id);
+        const page = pageOf(instance);
+        const bytes = Buffer.from(
+          await page.screenshot({ type: "jpeg", quality: FRAME_QUALITY, timeout: 10_000 }),
+        );
+        if (bytes.length > MAX_FRAME_BYTES)
+          throw new WorkerError("FRAME_TOO_LARGE", "The mirrored frame was too large.", 502);
+        return {
+          bytes,
+          cursor: { ...instance.cursor },
+          url: page.url().slice(0, 2000),
+          title: (await page.title().catch(() => "")).slice(0, 300),
+        } satisfies Frame;
       }),
     downloads: async (id: string) => {
       const saved = await downloads(id);

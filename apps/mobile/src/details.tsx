@@ -10,6 +10,7 @@ import {
   FileText,
   Globe2,
   Mail as MailIcon,
+  Radio,
   Reply,
   RotateCw,
   Save,
@@ -35,6 +36,7 @@ import {
 import { DelegateSheet, NotificationsSheet, TaskDetail } from "./agent-ui";
 import BrowserConsole from "./BrowserConsole";
 import { browserAddress, browserSite } from "./browser-address";
+import { BrowserMirror } from "./browser-mirror";
 import { ComputerSheet } from "./computer";
 import DateTimeEditor from "./DateTimeEditor";
 import { localDateTime, zonedInstant } from "./date-time";
@@ -847,6 +849,9 @@ function BrowserDetail({ initial }: { initial: BrowserSession }) {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
   const [retry, setRetry] = useState(0);
+  // The live mirror is opt-in rather than automatic: it holds a socket and a
+  // screen-scraping connection open, so it should cost something to ask for.
+  const [live, setLive] = useState(false);
   const latest = w.browsers.find((b) => b.id === initial.id);
   const browser = {
     ...(latest && latest.updatedAt > local.updatedAt ? latest : local),
@@ -950,6 +955,8 @@ function BrowserDetail({ initial }: { initial: BrowserSession }) {
             </>
           )}
         </View>
+      ) : live ? (
+        <BrowserMirror sessionId={browser.id} />
       ) : browser.status === "active" && browser.consoleUrl ? (
         <BrowserConsole url={api.url(browser.consoleUrl)} />
       ) : browser.status === "active" && browser.previewUrl ? (
@@ -972,6 +979,11 @@ function BrowserDetail({ initial }: { initial: BrowserSession }) {
         />
       )}
       <View style={[s.row, { gap: 10, marginTop: 18, flexWrap: "wrap" }]}>
+        {!loading && browser.status === "active" && (
+          <Button icon={Radio} primary={live} onPress={() => setLive(!live)}>
+            {live ? "Stop live view" : "Watch live"}
+          </Button>
+        )}
         {!loading && browser.status === "active" && browser.consoleUrl && (
           <Button
             icon={ExternalLink}

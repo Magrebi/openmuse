@@ -67,6 +67,37 @@ const failureSchema = z.object({
 });
 type ChatBrowser = { id: string; sessionId: string };
 
+/** One frame of the live browser mirror, as the mirror hub consumes it. */
+export interface BrowserFrame {
+  jpeg: Uint8Array;
+  cursor: { x: number; y: number };
+  url?: string;
+  title?: string;
+}
+
+/**
+ * A header value from the worker, decoded and bounded.
+ *
+ * The URL and title arrive percent-encoded in headers because a raw header value
+ * cannot hold arbitrary page text. A malformed one is dropped rather than
+ * allowed to throw: a frame with no title is still worth showing.
+ */
+const headerText = (value: string | null, max: number): string | undefined => {
+  if (!value) return undefined;
+  try {
+    const decoded = decodeURIComponent(value);
+    return decoded.length > max ? decoded.slice(0, max) : decoded;
+  } catch {
+    return undefined;
+  }
+};
+
+/** A numeric header, with anything unusable read as an unset coordinate. */
+const headerNumber = (value: string | null): number => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+};
+
 export class BrowserService {
   private readonly queues = new Map<string, Promise<unknown>>();
   private health?: { checkedAt: number; reachable: Promise<boolean> };
@@ -365,6 +396,33 @@ export class BrowserService {
       return result;
     });
   }
+  /**
+   * One frame of the agent's browser, for the live mirror.
+   *
+   * Ownership is checked before anything is captured, exactly as for every other
+   * read of this session: a mirror socket must not become a way to watch a
+   * browser belonging to somebody else.
+   */
+  async frame(owner: string, id: string, signal?: AbortSignal): Promise<BrowserFrame> {
+    await this.get(owner, id);
+    // Serialised on the session queue so a mirror at 4fps cannot interleave with
+    // the very action the person is watching.
+    return this.serial(id, async () => {
+      signal?.throwIfAborted();
+      const response = await this.request(`/sessions/${id}/frame`, undefined, signal);
+      const jpeg = new Uint8Array(await response.arrayBuffer());
+      return {
+        jpeg,
+        cursor: {
+          x: headerNumber(response.headers.get("x-openmuse-cursor-x")),
+          y: headerNumber(response.headers.get("x-openmuse-cursor-y")),
+        },
+        url: headerText(response.headers.get("x-openmuse-url"), 2000),
+        title: headerText(response.headers.get("x-openmuse-title"), 300),
+      };
+    });
+  }
+
   async imports(owner: string, id: string) {
     await this.get(owner, id);
     const { downloads, failures } = z
