@@ -388,6 +388,11 @@ fn emit_log(app: AppHandle, service: String, line: String) {
 /// tested; this layer only blits. An absent or empty list means the agent is
 /// idle, and the plain icon is correct — drawing minimum-height stubs would
 /// report activity that is not happening.
+///
+/// Backend-ready, not yet called by the shipped desktop UI: `ui/main.ts`
+/// invokes only `write_file` and `open_web_ui`, so the tray keeps the icon it
+/// was built with. `apps/desktop/README.md` states the same, so the claim is
+/// not made in one place and retracted in another.
 #[tauri::command]
 fn announce(
     app: AppHandle,

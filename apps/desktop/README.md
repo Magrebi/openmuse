@@ -26,6 +26,12 @@ around it and then opens `http://127.0.0.1:8081` in a webview.
 - **Tray and notifications.** Grey when stopped, amber while starting or
   degraded, green when healthy, red on error.
 
+> **Note:** The per-service log tabs and the tray's colour changes are
+> implemented in the Rust backend (`spawn_logged`, `announce`) but are not yet
+> wired to the desktop UI, which invokes only `write_file` and `open_web_ui`.
+> The tray currently shows a static icon and the Logs tab is not yet populated.
+> The commands themselves are registered and functional.
+
 ## What it does not do
 
 - It is not a second configuration store. Canonical state stays in `.env`, the

@@ -94,7 +94,12 @@ window.
 1. Download the OpenMuse installer for your platform from [releases](https://github.com/CopilotKit/OpenMuse/releases) and install Docker Desktop.
 2. Launch OpenMuse and point it at your OpenMuse folder.
 3. Follow the setup wizard. It generates the secrets, writes them to `.env`, and shows you a diff before saving. You will need a CopilotKit Intelligence key from `npx copilotkit@latest login`, and a model provider key if you want the agent to delegate.
-4. Press **Start**. The tray icon turns green when the API is healthy, then the web app opens.
+4. Press **Start**. The desktop app runs the health checks and then opens the web app.
+
+> **Note:** Tray status updates (the icon changing colour with the deployment
+> state) and per-service log streaming are implemented in the Rust backend but
+> are not yet connected to the desktop UI. The tray currently shows a static
+> icon, and the Logs tab is not yet populated.
 
 The wizard is re-runnable: it repairs a `.env` that is missing or incomplete and
 keeps any secret that is already valid. Stopping the stack never deletes your
