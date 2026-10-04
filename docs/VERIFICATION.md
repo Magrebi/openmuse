@@ -7,7 +7,7 @@ end-to-end UI capture.
 
 ## Automated checks (this audit)
 
-- **432 tests pass**, no failures, no skips, on Node 24 / pnpm 11.19.0. The
+- **433 tests pass**, no failures, no skips, on Node 24 / pnpm 11.19.0. The
   suite grew from 416 at the start of this pass.
 - Biome, and the root + mobile + desktop + worker TypeScript checks, are clean.
 - New checks added here:
@@ -24,9 +24,13 @@ end-to-end UI capture.
   - **PDF text ownership (3 checks).** An owner's PDF text reads back through the
     service; another owner is refused with the same 404 as the bytes; an
     out-of-range page request is a 422.
-  - **SQL-side filtering (1 check).** `listWhere` returns only matching records in
+  - **SQL-side filtering (2 checks).** `listWhere` returns only matching records in
     the expected order, still honours ownership, and returns an empty array for
-    a value with no matches.
+    a value with no matches. `searchText` keeps the old in-memory matching rule
+    (every word must appear, across the same four fields), the query plan is
+    asserted to use the `taskId` index rather than a post-filter, the Sent-mail
+    exclusion is pinned to the labels the previous JavaScript regex kept, and a
+    non-identifier field name is rejected before any statement is sent.
 
 ## Verified by inspection, not by execution
 
