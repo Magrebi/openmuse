@@ -4,6 +4,7 @@ import { join } from "node:path";
 import type { Config } from "./config.ts";
 import type { Store } from "./db.ts";
 import { AppError } from "./errors.ts";
+import { backgroundFailure } from "./log.ts";
 
 const digest = (value: string) => createHash("sha256").update(value).digest();
 export class Auth {
@@ -26,17 +27,37 @@ export class Auth {
       owner: "local-user",
       expiresAt: Date.now() + 24 * 60 * 60 * 1000,
     });
+    // L1: nothing else ever deleted a session row, so the collection only grew
+    // and each entry kept a bearer-token digest long past its 24 hour expiry.
+    // Signing in is the one moment sessions are known to be collectable, and it
+    // is rare, so it is the natural place to sweep. A cleanup failure must not
+    // refuse a sign-in that otherwise succeeded.
+    try {
+      await this.db.pruneExpired("system", "sessions", Date.now());
+    } catch (error) {
+      backgroundFailure("prune expired sessions", error);
+    }
     return { token, mode: this.config.mode };
   }
   async owner(authorization?: string) {
     if (!authorization?.startsWith("Bearer ")) throw new AppError("Sign in to OpenMuse", 401);
+    const id = digest(authorization.slice(7)).toString("hex");
     const session = await this.db.get<{ owner: string; expiresAt: number }>(
       "system",
       "sessions",
-      digest(authorization.slice(7)).toString("hex"),
+      id,
     );
-    if (!session || session.expiresAt < Date.now())
+    if (!session) throw new AppError("Session expired. Sign in again.", 401);
+    if (session.expiresAt < Date.now()) {
+      // The token is already unusable, so dropping its row changes no decision
+      // and stops the digest outliving the session it stands for.
+      try {
+        await this.db.remove("system", "sessions", id);
+      } catch (error) {
+        backgroundFailure("remove expired session", error);
+      }
       throw new AppError("Session expired. Sign in again.", 401);
+    }
     return session.owner;
   }
   sign(owner: string, path: string) {
