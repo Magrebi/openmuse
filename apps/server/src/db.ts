@@ -157,5 +157,12 @@ export async function createStore(
   await database.query(
     "CREATE TABLE IF NOT EXISTS records(owner text NOT NULL,kind text NOT NULL,id text NOT NULL,data jsonb NOT NULL,updated_at timestamptz NOT NULL DEFAULT now(),PRIMARY KEY(owner,kind,id))",
   );
+  // Task detail reads are filtered by taskId. Without this the planner can only
+  // reach them through the primary key and then discard every row of that kind,
+  // which grows with the owner's whole task history. Verified with EXPLAIN: with
+  // the index the taskId becomes an index condition instead of a filter.
+  await database.query(
+    "CREATE INDEX IF NOT EXISTS records_task_id ON records(owner,kind,(data->>'taskId'))",
+  );
   return new Store(database);
 }
