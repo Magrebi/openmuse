@@ -742,7 +742,7 @@ export class AgentService {
     context: TaskContext,
   ) {
     await context.guard();
-    assertCasaOSAppAllowed(this.config.casaosProtectedApps, data.app);
+    assertCasaOSAppAllowed(this.config.casaosProtectedApps, data.app, this.config.casaosSelfApps);
     const proposal = await this.actions.propose(
       owner,
       { kind: "casaos.action", data },

@@ -69,7 +69,11 @@ export function buildCasaOSTools(scope: CasaOSToolScope): ToolDefinition[] {
         note: z.string().max(500).optional(),
       }),
       async ({ app, note }) => {
-        assertCasaOSAppAllowed(service.config.casaosProtectedApps, app);
+        assertCasaOSAppAllowed(
+          service.config.casaosProtectedApps,
+          app,
+          service.config.casaosSelfApps,
+        );
         await getCasaOS().validateApp(app);
         // Task-scoped idempotency: the same action proposed again in a later
         // task (or after a terminal record) must create a fresh review.
@@ -118,7 +122,7 @@ export function buildCasaOSTools(scope: CasaOSToolScope): ToolDefinition[] {
     ),
     tool(
       "casaos_app_logs",
-      `Read a CasaOS app's recent logs. Secrets are redacted and output is capped to an 8KB tail. ${untrusted}`,
+      `Read a CasaOS app's recent logs. Returns a shape summary (line count, error/warning level tallies and the line numbers that look notable) rather than raw text, because log redaction is best-effort and cannot recognise every application's secret format. Raw redacted text is returned only when the operator has explicitly enabled it. ${untrusted}`,
       z.object({
         app: z.string().min(1).max(128),
         tail_lines: z.number().int().min(1).max(500).optional(),

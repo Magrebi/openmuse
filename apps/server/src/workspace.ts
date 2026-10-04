@@ -59,6 +59,7 @@ export class WorkspaceService {
       owner,
       loadCredentials: () => loadCasaOSCredentials(this.db, this.config, owner),
       allowInsecureHttp: this.config.casaosAllowInsecureHttp ?? false,
+      logToModel: this.config.casaosLogToModel,
     });
   }
   async casaOSConnection(owner: string) {
@@ -364,7 +365,11 @@ export class WorkspaceService {
     if (input.kind === "casaos.action") {
       // Protection list enforced at proposal time; appgrid membership is validated
       // by the CasaOS client before proposing and again at execution time.
-      assertCasaOSAppAllowed(this.config.casaosProtectedApps, input.data.app);
+      assertCasaOSAppAllowed(
+        this.config.casaosProtectedApps,
+        input.data.app,
+        this.config.casaosSelfApps,
+      );
       return { input };
     }
     if (input.kind === "email.send") {
@@ -471,7 +476,7 @@ export class WorkspaceService {
     connectionId?: string,
   ): Promise<string> {
     const { app, action } = input.data;
-    assertCasaOSAppAllowed(this.config.casaosProtectedApps, app);
+    assertCasaOSAppAllowed(this.config.casaosProtectedApps, app, this.config.casaosSelfApps);
     const creds = await loadCasaOSCredentials(this.db, this.config, owner);
     if (!creds)
       throw new AppError("CasaOS is disconnected. Reconnect before approving this action.", 409);
