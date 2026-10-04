@@ -19,6 +19,7 @@ import { AgentService } from "./engine/service.ts";
 import { AppError } from "./errors.ts";
 import { Files } from "./files.ts";
 import { GoogleAuth } from "./google-auth.ts";
+import { UndoQueue } from "./undo.ts";
 import { WorkspaceService } from "./workspace.ts";
 
 export async function createApp(
@@ -38,6 +39,10 @@ export async function createApp(
     connected: (owner) => workspace.connected(owner),
     connection: (owner) => workspace.connection(owner),
   });
+  // Reversible actions run through here rather than through the review gate.
+  // The queue holds them for five seconds and publishes an undo window; the gate
+  // is kept for anything irreversible. See `undo.ts` for why.
+  const undo = new UndoQueue();
   const browser = new BrowserService(db, config, auth, files);
   const computer = new ComputerService(db, config, options.docker);
   const agent = new AgentService(db, config, workspace, files, actions, browser, computer);
@@ -344,8 +349,19 @@ export async function createApp(
     );
     return new Response(body, { status: response.status, headers: response.headers });
   });
+  app.get("/api/undo", (c) => c.json(undo.forOwner(c.get("owner"))));
+  app.post("/api/undo/:id", async (c) => {
+    // Membership is checked before the undo, because the queue is keyed by id
+    // alone: without this, one owner could take back another's pending action by
+    // guessing its id.
+    const owner = c.get("owner");
+    const id = c.req.param("id");
+    if (!undo.forOwner(owner).some((entry) => entry.id === id))
+      throw new AppError("That action is no longer available to undo", 404);
+    return c.json(await undo.undo(id));
+  });
   app.get("/", (c) =>
     c.json({ name: "OpenMuse", app: "http://localhost:8081", health: "/api/health" }),
   );
-  return { app, auth, files, actions, workspace, agent, computer, browser };
+  return { app, auth, files, actions, workspace, agent, computer, browser, undo };
 }

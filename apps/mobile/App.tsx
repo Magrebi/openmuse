@@ -40,6 +40,7 @@ import { Details } from "./src/details";
 import { BrowserScreen, CalendarScreen, FilesScreen, MailScreen } from "./src/screens";
 import { ThreadsProvider, ThreadsSheet, useMuseThread } from "./src/threads";
 import { Button, Card, colors, ErrorNotice, Field, IconButton, Mascot, s } from "./src/ui";
+import { UndoToast } from "./src/undo-toast";
 import { type Detail, useWorkspace, WorkspaceContext } from "./src/workspace";
 
 const nav: { id: Section; label: string; icon: LucideIcon }[] = [
@@ -240,7 +241,7 @@ function WorkspaceShell({
   error: string;
   prompt?: { id: number; text: string };
 }) {
-  const { workspace, section, navigate, open } = useWorkspace();
+  const { workspace, api, section, navigate, open } = useWorkspace();
   const { data } = useAgentWorkspace();
   const {
     selection,
@@ -502,6 +503,7 @@ function WorkspaceShell({
           </View>
         )}
         {threadsOpen && <ThreadsSheet onClose={() => setThreadsOpen(false)} />}
+        <UndoToast api={api} />
         {detail && (
           <Details
             key={
