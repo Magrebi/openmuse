@@ -31,6 +31,7 @@ import {
   WEB_URL_MESSAGE,
   waitInputSchema,
 } from "./browser-input.ts";
+import { intentionFor } from "./intention.ts";
 import type { AgentService } from "./service.ts";
 import { tanstackAgent } from "./tanstack-agent.ts";
 import type { TaskContext } from "./worker.ts";
@@ -87,7 +88,10 @@ export async function executeModelTask(
               reason: "The task is waiting or finished; do not perform more actions.",
             };
           await ctx.guard();
-          await ctx.event("step", description);
+          // The intention is recorded *before* the call, so a slow tool shows
+          // what it is doing rather than a frozen screen. An unknown tool falls
+          // back to its description, which is always at least accurate.
+          await ctx.event("step", intentionFor(name, args) ?? description);
           try {
             return await execute(parameters.parse(args));
           } catch (error) {

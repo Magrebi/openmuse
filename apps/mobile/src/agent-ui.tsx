@@ -34,6 +34,8 @@ import type {
   RunEvent,
 } from "../../../packages/domain/src/agent";
 import { useAgentWorkspace } from "./agent-workspace";
+import { toCotSteps } from "./cot";
+import { CotAccordion } from "./cot-accordion";
 import { ActivityScreen, ConnectionsScreen } from "./screens";
 import {
   Button,
@@ -588,24 +590,34 @@ export function TaskDetail({ taskId }: { taskId: string }) {
               <EvidenceList items={task.evidence} />
             </View>
           )}
-          <Text style={s.heading}>Timeline</Text>
-          {detail?.events.map((event) => (
-            <View
-              key={event.id}
-              style={{ gap: 4, paddingLeft: 14, borderLeftWidth: 2, borderLeftColor: colors.line }}
-            >
-              <Text style={s.small}>
-                {stamp(event.date)} · {statusLabel(event.kind)}
-              </Text>
-              <Text style={s.text}>{event.title}</Text>
-              <Text selectable style={s.muted}>
-                {event.detail}
-              </Text>
-            </View>
-          ))}
-          {!detail?.events.length && (
-            <Text style={s.muted}>The worker will record each step here.</Text>
-          )}
+          <View style={{ gap: 22 }}>
+            <CotAccordion steps={toCotSteps(detail?.events ?? [])} title="Working" />
+            {!!detail?.events.length && (
+              <View style={{ gap: 12 }}>
+                <Text style={s.heading}>Full timeline</Text>
+                <Text style={[s.small, { marginTop: -6 }]}>Every recorded step, in order.</Text>
+                {detail?.events.map((event) => (
+                  <View
+                    key={event.id}
+                    style={{
+                      gap: 4,
+                      paddingLeft: 14,
+                      borderLeftWidth: 2,
+                      borderLeftColor: colors.line,
+                    }}
+                  >
+                    <Text style={s.small}>
+                      {stamp(event.date)} · {statusLabel(event.kind)}
+                    </Text>
+                    <Text style={s.text}>{event.title}</Text>
+                    <Text selectable style={s.muted}>
+                      {event.detail}
+                    </Text>
+                  </View>
+                ))}
+              </View>
+            )}
+          </View>
         </View>
       )}
     </Sheet>
