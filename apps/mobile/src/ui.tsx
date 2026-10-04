@@ -1,8 +1,7 @@
 import { ArrowUpRight, Check, ChevronRight, type LucideIcon, X } from "lucide-react-native";
-import type { ReactNode } from "react";
+import { type ReactNode, useEffect, useMemo, useRef } from "react";
 import {
   ActivityIndicator,
-  Image,
   Modal,
   Pressable,
   ScrollView,
@@ -14,7 +13,22 @@ import {
   View,
   type ViewStyle,
 } from "react-native";
+import Animated, {
+  useAnimatedStyle,
+  useSharedValue,
+  withSpring,
+  withTiming,
+} from "react-native-reanimated";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
+import type { MascotSignals } from "./mascot.ts";
+import { AnimatedMascot } from "./mascot.tsx";
+import { durations, springs } from "./motion.ts";
+import {
+  restFrame,
+  type SharedFrame,
+  type Rect as SharedRect,
+  startFrame,
+} from "./shared-element.ts";
 export const colors = {
   canvas: "#FCFCFC",
   card: "#FFFFFF",
@@ -187,8 +201,118 @@ export function IconButton({
     </Pressable>
   );
 }
-export function Card({ children, style }: { children: ReactNode; style?: ViewStyle }) {
-  return <View style={[s.card, style]}>{children}</View>;
+/**
+ * A card that reports where it is when it is pressed.
+ *
+ * This is how the "tapping a `TaskCard` expands it into the Details view"
+ * transition is built. Reanimated's own `sharedTransitionTag` was the obvious
+ * route and it is deliberately not used: in 4.x it is an experimental feature
+ * behind a feature flag, it only works with a native stack navigator (OpenMuse
+ * presents sheets in a `Modal`), it is explicitly unsupported on web, and the
+ * docs note it does not work through a transparent modal on iOS. Every one of
+ * those is this app. So the card publishes its own on-screen rectangle and the
+ * sheet animates from exactly that rectangle — see `shared-element.ts`.
+ *
+ * The callback is optional: a card that is never the source of a transition
+ * does not need to measure itself, and measurement forces a layout pass.
+ */
+export function Card({
+  children,
+  style,
+  onLayoutInWindow,
+}: {
+  children: ReactNode;
+  style?: ViewStyle;
+  /** Called with this card's absolute screen rectangle as it is laid out. */
+  onLayoutInWindow?: (rect: SharedRect) => void;
+}) {
+  return (
+    <View
+      style={[s.card, style]}
+      // Only measured when someone is going to use the result. `measureInWindow`
+      // is relative to the window, which is what the sheet's transform needs.
+      ref={
+        onLayoutInWindow
+          ? (node) => {
+              node?.measureInWindow((x, y, width, height) =>
+                onLayoutInWindow({ x, y, width, height }),
+              );
+            }
+          : undefined
+      }
+    >
+      {children}
+    </View>
+  );
+}
+
+/**
+ * A box whose height grows to fit text that is still arriving.
+ *
+ * Tool results stream in token by token, and a box that jumps to each new size
+ * makes everything below it jump too — the transcript appears to stutter. The
+ * height here is interpolated on a critically damped spring instead, and the
+ * inner content is allowed to overflow its box, so text is never clipped while
+ * the height catches up.
+ */
+export function StreamingBox({
+  children,
+  streaming,
+  style,
+}: {
+  children: ReactNode;
+  /** True while content is still arriving. */
+  streaming?: boolean;
+  style?: ViewStyle;
+}) {
+  const height = useSharedValue(0);
+  const measured = useSharedValue(0);
+  const styleFor = useAnimatedStyle(() => ({
+    height: height.value > 0 ? height.value : undefined,
+  }));
+  return (
+    <Animated.View
+      style={[style, styleFor]}
+      onLayout={(event) => {
+        // Layout runs on the JS thread, so the height it reports is copied into
+        // the shared value and animated on the UI thread from there.
+        const next = event.nativeEvent.layout.height;
+        if (next > 0 && Math.abs(next - measured.value) > 0.5) {
+          measured.value = next;
+          height.value = withSpring(next, springs.streaming);
+        }
+      }}
+    >
+      <Animated.View
+        style={streaming ? { opacity: withTiming(1, { duration: durations.quick }) } : undefined}
+      >
+        {children}
+      </Animated.View>
+    </Animated.View>
+  );
+}
+
+/**
+ * OpenMuse's capybara.
+ *
+ * The original was a static PNG, which meant the one element that could have
+ * conveyed "the agent is working" conveyed nothing. It now breathes, leans and
+ * blinks, and its posture is derived from what the agent is actually doing — see
+ * `mascot.ts` for the state machine and why the precedence is what it is.
+ *
+ * A caller that knows the agent's state passes `signals`; the figure resolves
+ * its own state and labels itself for screen readers.
+ */
+export function Mascot({
+  size = 42,
+  variant = "sky",
+  signals,
+}: {
+  size?: number;
+  variant?: "sky" | "sand" | "lilac";
+  signals?: MascotSignals;
+}) {
+  return <AnimatedMascot size={size} variant={variant} signals={signals} />;
 }
 export function Chip({ children, tint }: { children: ReactNode; tint?: string }) {
   return (
@@ -243,26 +367,81 @@ export function ErrorNotice({ error }: { error?: string }) {
     </View>
   ) : null;
 }
+/**
+ * A sheet that becomes the thing that was tapped.
+ *
+ * When `origin` is supplied the panel starts life at exactly that rectangle and
+ * travels to where it belongs on the shared spring; with no origin it fades up
+ * from just below its settled position. Both the scrim and the panel are driven
+ * from one shared value, so a sheet dismissed early can be reversed mid-flight
+ * rather than snapping away — which is what `Modal`'s own `animationType` did,
+ * since it is a fixed platform curve with no exit variant.
+ */
 export function Sheet({
   title,
   subtitle,
   children,
   onClose,
   wide,
+  origin,
 }: {
   title: string;
   subtitle?: string;
   children: ReactNode;
   onClose: () => void;
   wide?: boolean;
+  /** The on-screen rectangle of the element this sheet is becoming. */
+  origin?: SharedRect | null;
 }) {
-  const { width } = useWindowDimensions();
+  const { width, height } = useWindowDimensions();
   const insets = useSafeAreaInsets();
   const compact = width < 600;
+  const progress = useSharedValue(0);
+  const panelStyle = useSharedValue<SharedFrame>(restFrame());
+  const panelNode = useRef<View | null>(null);
+  const window = useMemo(() => ({ x: 0, y: 0, width, height }), [width, height]);
+
+  // Measured on the first frame the sheet is on screen, because until then the
+  // panel has no geometry and there is nothing to travel from.
+  useEffect(() => {
+    let cancelled = false;
+    panelNode.current?.measureInWindow((x, y, w, h) => {
+      if (cancelled) return;
+      const measured: SharedRect = { x, y, width: w, height: h };
+      const from = startFrame(origin, measured, window);
+      // Seed both shared values so the very first rendered frame is already at
+      // the source. Without this the panel paints at full size for one frame and
+      // then snaps back to the card, which reads as a flicker.
+      progress.value = 0;
+      panelStyle.value = from;
+      progress.value = withSpring(1, springs.shared);
+    });
+    return () => {
+      cancelled = true;
+    };
+    // `origin` is read once per mount: re-measuring on every change would restart
+    // the animation if the origin object were recreated by a parent render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [origin, panelStyle, progress, window]);
+
+  const animatedPanel = useAnimatedStyle(() => ({
+    opacity: panelStyle.value.opacity,
+    transform: [
+      { translateX: panelStyle.value.translateX },
+      { translateY: panelStyle.value.translateY },
+      { scaleX: panelStyle.value.scaleX },
+      { scaleY: panelStyle.value.scaleY },
+    ],
+  }));
+  const shade = useAnimatedStyle(() => ({ opacity: progress.value }));
+
   return (
-    <Modal transparent animationType={compact ? "slide" : "fade"} visible onRequestClose={onClose}>
-      <View style={[s.modalShade, compact && { padding: 0, justifyContent: "flex-end" }]}>
-        <View
+    <Modal transparent visible onRequestClose={onClose}>
+      <Animated.View
+        style={[s.modalShade, compact && { padding: 0, justifyContent: "flex-end" }, shade]}
+      >
+        <Animated.View
+          ref={panelNode}
           accessibilityViewIsModal
           style={[
             s.sheet,
@@ -273,6 +452,7 @@ export function Sheet({
               paddingBottom: Math.max(insets.bottom, 12),
               maxHeight: "94%",
             },
+            animatedPanel,
           ]}
         >
           {compact && (
@@ -305,8 +485,8 @@ export function Sheet({
           >
             {children}
           </ScrollView>
-        </View>
-      </View>
+        </Animated.View>
+      </Animated.View>
     </Modal>
   );
 }
@@ -397,41 +577,6 @@ export function LinkRow({
       </View>
       <ChevronRight size={15} color={colors.muted} />
     </Pressable>
-  );
-}
-/** OpenMuse's original capybara, shared by every assistant surface. */
-export function Mascot({
-  size = 42,
-  variant = "sky",
-}: {
-  size?: number;
-  variant?: "sky" | "sand" | "lilac";
-}) {
-  const palette = {
-    sky: "#ECF5FA",
-    sand: "#FAF0DF",
-    lilac: "#F1ECF9",
-  }[variant];
-  return (
-    <View accessibilityLabel="OpenMuse capybara" style={{ width: size, height: size }}>
-      <View
-        style={{
-          position: "absolute",
-          top: size * 0.15,
-          left: size * 0.12,
-          width: size * 0.76,
-          height: size * 0.76,
-          borderRadius: size,
-          backgroundColor: palette,
-        }}
-      />
-      <Image
-        source={require("../assets/capybara.png")}
-        resizeMode="contain"
-        style={{ width: size, height: size }}
-        accessible={false}
-      />
-    </View>
   );
 }
 export function dateLabel(value: string, options?: Intl.DateTimeFormatOptions) {
