@@ -75,6 +75,20 @@ export class Store {
     );
     return result.rows.map((row) => row.data as { owner: string; value: T });
   }
+  /**
+   * Delete the rows of one kind whose numeric `expiresAt` has already passed.
+   *
+   * Only rows that actually look like an epoch-millisecond expiry are considered.
+   * The anchored digit test runs BEFORE the cast, so a row that is missing
+   * `expiresAt` or holds something else is skipped rather than raising and taking
+   * every other row down with the statement.
+   */
+  async pruneExpired(owner: string, kind: string, now: number): Promise<void> {
+    await this.db.query(
+      "DELETE FROM records WHERE owner=$1 AND kind=$2 AND data->>'expiresAt' ~ '^[0-9]+$' AND (data->>'expiresAt')::bigint<=$3",
+      [owner, kind, now],
+    );
+  }
   async claim<T>(owner: string, id: string, status: string, now: string): Promise<T | null> {
     const result = await this.db.query(
       `UPDATE records AS action SET data=jsonb_set(data,'{status}',$4::jsonb),updated_at=now()
@@ -99,6 +113,18 @@ export class Store {
       [owner, kind, id],
     );
     return (result.rows[0]?.data as T | undefined) ?? null;
+  }
+  /**
+   * The names of the secondary indexes defined on `records`.
+   *
+   * The column is aliased to `data` because that is the key this store's
+   * Database adapter exposes; every read goes through it.
+   */
+  async indexNames(): Promise<string[]> {
+    const result = await this.db.query(
+      "SELECT indexname AS data FROM pg_indexes WHERE tablename='records'",
+    );
+    return result.rows.map((row) => String(row.data));
   }
   close(): Promise<void> {
     return this.db.close();
@@ -139,6 +165,18 @@ export async function createStore(
     "CREATE TABLE IF NOT EXISTS records(owner text NOT NULL,kind text NOT NULL,id text NOT NULL,data jsonb NOT NULL,updated_at timestamptz NOT NULL DEFAULT now(),PRIMARY KEY(owner,kind,id))",
   );
   // No migration framework exists; DDL runs here on every startup (idempotent).
+  //
+  // L2: scan() filters on `kind` alone and is the only index-free read left. It
+  // runs on the 1s worker tick (engine/worker.ts) and every 60s from maintain()
+  // (engine/service.ts), so without an index each poll reads and materialises the
+  // whole table for every owner. (kind, updated_at) serves both the equality
+  // filter and the existing ORDER BY, so the index also removes the sort.
+  // Not created speculatively: no query in this tree reads `data->>'taskId'`
+  // (there is no listWhere/searchText here), so that expression index would
+  // only add write cost. Add it with the query that needs it.
+  await database.query(
+    "CREATE INDEX IF NOT EXISTS records_kind_updated ON records(kind, updated_at)",
+  );
   // safe_timestamptz lets claim() compare expiresAt without ever throwing on
   // malformed values: bad input yields NULL, and NULL > x is not true, so the
   // row is simply skipped instead of raising a DB exception.
