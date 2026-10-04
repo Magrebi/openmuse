@@ -95,10 +95,24 @@ function notConnectedError(): AppError {
 /**
  * Throws when the app name must never be touched, even with approval.
  * Called at proposal time AND at execution time.
+ *
+ * M2: the protected list is lexical, so it can only protect names it was told
+ * about. `selfApps` is the operator's positive declaration of every CasaOS app
+ * that hosts OpenMuse or its network access, so an installation named anything
+ * other than the built-ins is still refused. Both checks are kept: the list is
+ * the fast path, selfApps is the identity check that closes the naming gap.
  */
-export function assertCasaOSAppAllowed(protectedApps: string[], app: string): void {
+export function assertCasaOSAppAllowed(
+  protectedApps: string[],
+  app: string,
+  selfApps: string[] = [],
+): void {
   const normalized = app.trim().toLowerCase();
-  if (protectedApps.includes(normalized) || normalized.startsWith("openmuse-"))
+  if (
+    protectedApps.includes(normalized) ||
+    normalized.startsWith("openmuse-") ||
+    selfApps.includes(normalized)
+  )
     throw new AppError(
       `CasaOS app "${normalized}" is protected: it hosts OpenMuse or its network access and cannot be started, stopped or restarted.`,
       403,
