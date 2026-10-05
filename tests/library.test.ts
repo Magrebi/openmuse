@@ -668,12 +668,20 @@ test("a binary format reports no extractable text instead of returning garbage",
 });
 /* ============ 11. the agent's library tools ============ */
 
-/** Run one of the library tools the way the model runtime would. */
-function tool(owner: string, name: string, args: unknown, provenance = {}) {
+/**
+ * Run one of the library tools the way the model runtime would.
+ *
+ * `execute` is reached through the tool definition rather than by calling the
+ * service, so the parameter schemas are exercised too: a tool that would reject
+ * an argument in production must reject it here. The wrapper's error handling is
+ * covered by the test below that passes a missing document id.
+ */
+async function tool(owner: string, name: string, args: unknown, provenance = {}) {
   const built = libraryTools(server.library, owner, provenance);
-  const found = built.find((t) => t.name === name);
+  const found = built.find((candidate) => candidate.name === name);
   assert.ok(found, `no tool named ${name}`);
-  return found.execute(args, {} as never);
+  const execute = found.execute as (args: unknown, context?: unknown) => Promise<unknown>;
+  return execute(args);
 }
 
 test("the agent can search, attach, and save a document", async () => {
