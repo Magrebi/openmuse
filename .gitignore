@@ -6,6 +6,10 @@ build/
 .env.local
 .env.*.local
 .openmuse/
+# The deployed compose mounts ./data and points DATA_DIR into it, so this is
+# where the library keeps the owner's documents. Never commit it: the bytes are
+# the owner's, and git history does not forget.
+data/
 apps/mobile/ios/
 apps/mobile/android/
 .DS_Store
