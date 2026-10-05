@@ -54,6 +54,17 @@ export interface Config {
   computerImage?: string;
   computerDeploymentId?: string;
   allowedOrigins: string[];
+  /**
+   * Largest single library document accepted, in bytes, from `LIBRARY_MAX_FILE_MB`.
+   * Optional so a Config assembled without it (tests, embedded callers) still
+   * typechecks; `libraryLimits` applies the documented defaults.
+   */
+  libraryMaxFileBytes?: number;
+  /**
+   * Largest total library size per owner, in bytes, from `LIBRARY_MAX_TOTAL_MB`.
+   * Same optional-with-default shape as `libraryMaxFileBytes`.
+   */
+  libraryMaxTotalBytes?: number;
   casaosApiUrl: string;
   casaosProtectedApps: string[];
   /** Opt out of the HTTPS/loopback transport policy (trusted LANs only). */
@@ -112,6 +123,44 @@ export function browserWorkerUrl(value?: string): string | undefined {
 // writes never re-fire here: they are dispatched outside the model loop through
 // reviewed, idempotency-keyed actions.
 export const MODEL_MAX_RETRIES = 2;
+
+/** A library document is capped at 50 MB and an owner's library at 1 GB. */
+export const LIBRARY_DEFAULT_MAX_FILE_BYTES = 50 * 1024 * 1024;
+export const LIBRARY_DEFAULT_MAX_TOTAL_BYTES = 1024 * 1024 * 1024;
+
+/**
+ * Read `LIBRARY_MAX_FILE_MB` / `LIBRARY_MAX_TOTAL_MB` as byte counts.
+ *
+ * A blank, unparseable, non-positive or non-finite value falls back to the
+ * default rather than throwing: a typo in an optional quota must not stop the
+ * server from starting. `Number("")` is 0 and `Number(" 12 ")` is 12, so the
+ * blank case has to be excluded before the range test.
+ *
+ * The total is floored to at least the per-file limit. Otherwise an operator who
+ * sets a 500 MB total and leaves the 50 MB file default has configured a quota
+ * no single upload can ever satisfy past the first one, which reads as a broken
+ * library rather than as the setting that produced it.
+ */
+export function libraryLimits(env: Record<string, string | undefined> = process.env): {
+  maxFileBytes: number;
+  maxTotalBytes: number;
+} {
+  const megabytes = (name: string, fallback: number) => {
+    const raw = env[name]?.trim();
+    if (!raw) return fallback;
+    const value = Number(raw);
+    return Number.isFinite(value) && value > 0 ? Math.floor(value * 1024 * 1024) : fallback;
+  };
+  const maxFileBytes = megabytes("LIBRARY_MAX_FILE_MB", LIBRARY_DEFAULT_MAX_FILE_BYTES);
+  return {
+    maxFileBytes,
+    maxTotalBytes: Math.max(
+      megabytes("LIBRARY_MAX_TOTAL_MB", LIBRARY_DEFAULT_MAX_TOTAL_BYTES),
+      maxFileBytes,
+    ),
+  };
+}
+
 export function readConfig(): Config {
   const mode = process.env.WORKSPACE_MODE ?? "sample";
   if (mode !== "sample" && mode !== "live")
@@ -158,6 +207,13 @@ export function readConfig(): Config {
     allowedOrigins: (
       process.env.ALLOWED_ORIGINS ?? "http://localhost:8081,http://127.0.0.1:8081"
     ).split(","),
+    ...(() => {
+      const limits = libraryLimits();
+      return {
+        libraryMaxFileBytes: limits.maxFileBytes,
+        libraryMaxTotalBytes: limits.maxTotalBytes,
+      };
+    })(),
     // M1: no default address. A hardcoded fallback committed one operator's LAN
     // topology to the repository and, with CASAOS_ALLOW_INSECURE_HTTP=true,
     // sent the CasaOS password to whatever device later held that

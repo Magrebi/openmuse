@@ -29,6 +29,7 @@ import { AgentService } from "./engine/service.ts";
 import { AppError } from "./errors.ts";
 import { Files } from "./files.ts";
 import { GoogleAuth } from "./google-auth.ts";
+import { LibraryService, MAX_PAGE_SIZE, SHARE_MAX_DAYS } from "./library.ts";
 import { UndoQueue } from "./undo.ts";
 import { WorkspaceService } from "./workspace.ts";
 
@@ -50,6 +51,7 @@ export async function createApp(
   const auth = await createAuth(db, config),
     files = new Files(db, config, auth),
     google = new GoogleAuth(db, config),
+    library = new LibraryService(db, config),
     workspace = new WorkspaceService(db, config, files, google);
   const actions = new ActionService(db, {
     execute: (owner, input, connectionId, targetVersion) =>
@@ -66,7 +68,11 @@ export async function createApp(
   const undo = new UndoQueue();
   const browser = new BrowserService(db, config, auth, files);
   const computer = new ComputerService(db, config, options.docker);
-  const agent = new AgentService(db, config, workspace, files, actions, browser, computer);
+  // The app's own LibraryService is passed in so the HTTP routes and the agent
+  // tools share one instance and one view of the quota. The default on the
+  // constructor exists so a caller that builds an AgentService directly (tests,
+  // the separate worker) still works.
+  const agent = new AgentService(db, config, workspace, files, actions, browser, computer, library);
   const intelligence = new CopilotKitIntelligence({ apiKey: config.intelligenceApiKey });
   const runtime = makeRuntime(config, agent, auth, intelligence);
   const app = new Hono<{ Variables: { owner: string } }>();
@@ -88,13 +94,34 @@ export async function createApp(
       credentials: true,
     }),
   );
-  app.use(
-    "*",
-    bodyLimit({
-      maxSize: 12 * 1024 * 1024,
-      onError: (c) => c.json({ error: "Request is too large; PDFs must be 10 MB or smaller" }, 413),
-    }),
-  );
+  // The global body limit is sized for a PDF upload (10 MB plus multipart
+  // overhead). A library file may be up to 50 MB, so the library upload route
+  // gets its own limit — derived from the same config the service enforces, so
+  // the two can never disagree about what a legal upload weighs.
+  //
+  // The exemption is matched on the method and path, not on the caller, so it
+  // cannot become a way to post an unbounded body to some other route: a request
+  // that is not exactly `POST /api/library` still meets the 12 MB limit below.
+  const limit = bodyLimit({
+    maxSize: 12 * 1024 * 1024,
+    onError: (c) => c.json({ error: "Request is too large; PDFs must be 10 MB or smaller" }, 413),
+  });
+  const libraryUpload = bodyLimit({
+    maxSize: config.libraryMaxFileBytes ?? 50 * 1024 * 1024,
+    onError: (c) =>
+      c.json(
+        {
+          error: `That upload is too large. One library file may be at most ${
+            config.libraryMaxFileBytes ?? 50 * 1024 * 1024
+          } bytes.`,
+        },
+        413,
+      ),
+  });
+  app.use("*", async (c, next) => {
+    if (c.req.method === "POST" && c.req.path === "/api/library") return libraryUpload(c, next);
+    return limit(c, next);
+  });
   app.onError((error, c) => {
     if (error instanceof z.ZodError)
       return c.json({ error: error.issues.map((i) => i.message).join("; ") }, 422);
@@ -315,6 +342,113 @@ export async function createApp(
       .parse(await c.req.json());
     return c.json(await files.fill(c.get("owner"), c.req.param("id"), body.fields), 201);
   });
+
+  /* ------------------------------- Document library ------------------------------- */
+  //
+  // Every route below sits behind the `/api/*` auth middleware, so the owner is
+  // resolved from the access key before any handler runs and is passed in
+  // explicitly. Nothing here reads an owner from a request parameter or body.
+  //
+  // Listing returns metadata only. Bytes are served by exactly one handler
+  // (`serveDocument`), so the download headers cannot be forgotten on a second
+  // route.
+
+  app.get("/api/library", async (c) => {
+    const query = z
+      .object({
+        limit: z.coerce.number().int().min(1).max(MAX_PAGE_SIZE).default(MAX_PAGE_SIZE),
+        offset: z.coerce.number().int().min(0).max(100_000).default(0),
+      })
+      .parse(c.req.query());
+    return c.json({
+      ...(await library.list(c.get("owner"), query)),
+      usage: await library.usage(c.get("owner")),
+    });
+  });
+
+  app.post("/api/library", async (c) => {
+    const owner = c.get("owner");
+    const data = await c.req.parseBody();
+    const file = data.file;
+    if (!(file instanceof File)) throw new AppError("Choose a file to upload", 422);
+    return c.json(
+      await library.upload(owner, {
+        filename: file.name,
+        declaredType: file.type,
+        bytes: new Uint8Array(await file.arrayBuffer()),
+      }),
+      201,
+    );
+  });
+
+  app.get("/api/library/search", async (c) => {
+    const query = z
+      .object({
+        q: z.string().max(500).default(""),
+        limit: z.coerce.number().int().min(1).max(100).default(25),
+      })
+      .parse(c.req.query());
+    return c.json({ documents: await library.search(c.get("owner"), query.q, query.limit) });
+  });
+
+  app.get("/api/library/:id", async (c) =>
+    c.json(await library.get(c.get("owner"), c.req.param("id"))),
+  );
+
+  // The one place library bytes are served. Both the authenticated download and
+  // the share route come through here, so `attachment`, `nosniff` and the CSP
+  // sandbox are set on every path that can emit stored bytes.
+  /**
+   * Serve stored bytes with the download headers, for every path that emits them.
+   *
+   * `new Response` rather than `c.body`, so the bytes are passed through
+   * untouched instead of being copied to satisfy the body overload. The
+   * `Referrer-Policy` is set here as well as in the global middleware: a handler
+   * returning a bare Response does not inherit headers a middleware staged on the
+   * context, and a share token leaking through a Referer is exactly the sort of
+   * thing that gets missed once.
+   */
+  const serveDocument = async (result: { bytes: Uint8Array; headers: Record<string, string> }) => {
+    // `readFile` hands back a Node `Buffer`, whose backing store is typed
+    // `ArrayBufferLike` — the DOM `BodyInit` union wants a plain `ArrayBuffer`.
+    // Copying into a fresh `Uint8Array` satisfies that, and `Buffer.from` would
+    // only alias rather than copy, so this allocates exactly once.
+    const body = new Uint8Array(result.bytes.byteLength);
+    body.set(result.bytes);
+    return new Response(body, {
+      headers: { ...result.headers, "Referrer-Policy": "no-referrer" },
+    });
+  };
+
+  app.get("/api/library/:id/content", async (c) =>
+    serveDocument(await library.download(c.get("owner"), c.req.param("id"))),
+  );
+
+  // The share route is outside `/api/*`, so the session middleware never sees it:
+  // the token in the path is the credential. It is served by the same handler as
+  // the authenticated download, so a shared file carries the identical
+  // `attachment` + `nosniff` + CSP-sandbox headers and cannot be rendered as
+  // HTML by the browser that opens the link.
+  app.get("/s/:token", async (c) =>
+    serveDocument(await library.resolveShare(c.req.param("token"))),
+  );
+
+  app.delete("/api/library/:id", async (c) => {
+    await library.delete(c.get("owner"), c.req.param("id"));
+    return c.json({ deleted: true });
+  });
+
+  app.post("/api/library/:id/share", async (c) => {
+    const body = z
+      .object({ days: z.number().int().min(1).max(SHARE_MAX_DAYS).optional() })
+      .parse(await c.req.json().catch(() => ({})));
+    return c.json(await library.createShare(c.get("owner"), c.req.param("id"), body.days), 201);
+  });
+
+  app.delete("/api/library/:id/share", async (c) => {
+    await library.revokeShare(c.get("owner"), c.req.param("id"));
+    return c.json({ revoked: true });
+  });
   app.post("/api/mail/import-attachment", async (c) => {
     const body = z.object({ reference: z.string() }).parse(await c.req.json());
     return c.json(await workspace.importAttachment(c.get("owner"), body.reference), 201);
@@ -450,5 +584,5 @@ export async function createApp(
   app.get("/", (c) =>
     c.json({ name: "OpenMuse", app: "http://localhost:8081", health: "/api/health" }),
   );
-  return { app, auth, files, actions, workspace, agent, computer, browser, undo };
+  return { app, auth, files, actions, workspace, agent, computer, browser, undo, library };
 }

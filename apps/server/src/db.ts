@@ -362,6 +362,156 @@ export class Store {
     );
     return result.rows.length === 1;
   }
+
+  /* ---------------- Library storage quota ---------------- */
+
+  /**
+   * Claim `bytes` from an owner's library quota, atomically.
+   *
+   * This is the whole reason the quota lives in a counter row rather than in a
+   * `SELECT sum(...)` before an insert. A read-then-write check is a classic
+   * write skew: two uploads that both read "0 bytes used" before either wrote
+   * both see room, and both commit, so the owner's library overruns its quota.
+   * The accepted deployment is a single API process, but nothing should depend on
+   * that staying true.
+   *
+   * A single `UPDATE` with the limit in its `WHERE` clause is atomic on its own.
+   * Postgres takes a row lock on the counter, and under READ COMMITTED it
+   * *re-evaluates the predicate against the updated row* once the lock is granted.
+   * So the loser of a race wakes up, sees the incremented total, fails the
+   * predicate and writes nothing — the check and the write cannot be separated.
+   *
+   * Returns false when the owner is over the limit; the counter is then untouched,
+   * so a rejected upload costs no quota.
+   */
+  async reserveQuota(owner: string, kind: string, id: string, bytes: number, limit: number) {
+    if (!Number.isFinite(bytes) || bytes < 0 || !Number.isFinite(limit) || limit < 0)
+      throw new AppError("Invalid quota request", 400);
+    const result = await this.db.query(
+      `UPDATE records SET data=jsonb_set(data,'{used}',to_jsonb(safe_bigint(data->>'used')+$2::bigint)),updated_at=now()
+       WHERE owner=$1 AND kind=$3 AND id=$4
+         AND safe_bigint(data->>'used')+$2::bigint <= $5::bigint
+       RETURNING data->>'used' AS data`,
+      // Parameter order follows the SQL, not the signature: $2 is the byte count,
+      // $3 the kind, $4 the id, $5 the limit.
+      [owner, bytes, kind, id, limit],
+    );
+    if (result.rows.length !== 1) return false;
+    return Number(result.rows[0].data);
+  }
+
+  /**
+   * Give quota back after a deletion.
+   *
+   * `greatest(0, ...)` clamps the result rather than trusting the arithmetic: a
+   * counter that went negative would silently grant every future upload more room
+   * than the operator configured, and a double delete is exactly the sort of edge
+   * that reaches here.
+   */
+  async releaseQuota(owner: string, kind: string, id: string, bytes: number): Promise<void> {
+    if (!Number.isFinite(bytes) || bytes <= 0) return;
+    await this.db.query(
+      `UPDATE records SET data=jsonb_set(data,'{used}',to_jsonb(greatest(0::bigint,safe_bigint(data->>'used')-$2::bigint))),updated_at=now()
+       WHERE owner=$1 AND kind=$3 AND id=$4`,
+      [owner, bytes, kind, id],
+    );
+  }
+
+  /**
+   * One page of an owner's library, newest first, plus the total row count.
+   *
+   * The count is a separate `COUNT(*)` rather than a `LIMIT n+1` probe so the
+   * total reported to the UI is the real number of documents rather than an
+   * inference from a full page. `offset` is clamped in SQL and in JS: an
+   * unclamped negative offset is a Postgres error and an unclamped enormous one
+   * makes the table skip rows the planner has to walk.
+   */
+  async listLibraryPage<T = Record<string, unknown>>(
+    owner: string,
+    kind: string,
+    limit: number,
+    offset: number,
+  ): Promise<{ docs: T[]; total: number }> {
+    const capped = Number.isFinite(limit) ? Math.max(1, Math.min(100, Math.floor(limit))) : 50;
+    const skip = Number.isFinite(offset) ? Math.max(0, Math.min(100_000, Math.floor(offset))) : 0;
+    const [rows, count] = await Promise.all([
+      this.db.query(
+        "SELECT data FROM records WHERE owner=$1 AND kind=$2 ORDER BY updated_at DESC,id ASC LIMIT $3 OFFSET $4",
+        [owner, kind, capped, skip],
+      ),
+      this.db.query("SELECT count(*)::bigint AS data FROM records WHERE owner=$1 AND kind=$2", [
+        owner,
+        kind,
+      ]),
+    ]);
+    return { docs: rows.rows.map((row) => row.data as T), total: Number(count.rows[0]?.data ?? 0) };
+  }
+
+  /**
+   * Read a share row only while its link is still live.
+   *
+   * The expiry is compared in SQL through `safe_timestamptz`, which is the
+   * `claim()` 22008 bug class applied deliberately here: a `expiresAt` that looks
+   * like a timestamp but is not a real instant (`2026-13-45T00:00:00Z` matches
+   * the shape regex) would make a bare `::timestamptz` cast raise and take this
+   * statement — and every other share row — down. `safe_timestamptz` yields NULL
+   * for it, NULL compares false, and a malformed expiry therefore fails closed:
+   * the link simply stops working.
+   *
+   * `now()` supplies the comparison value, so no caller-supplied string is ever
+   * cast to a timestamp on this path.
+   */
+  async getLiveShare<T = Record<string, unknown>>(
+    scope: string,
+    kind: string,
+    id: string,
+  ): Promise<T | null> {
+    const result = await this.db.query(
+      `SELECT data FROM records
+       WHERE owner=$1 AND kind=$2 AND id=$3
+         AND data->>'expiresAt' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$'
+         AND safe_timestamptz(data->>'expiresAt') > now()
+       `,
+      [scope, kind, id],
+    );
+    return (result.rows[0]?.data as T | undefined) ?? null;
+  }
+
+  /**
+   * Search one owner's library documents by full text.
+   *
+   * `to_tsvector`/`plainto_tsquery` on the extracted text of a separate
+   * `library-text` kind, left-joined to the metadata row. The extracted body is
+   * kept out of the metadata record so a page of the library list never drags
+   * 100 KB of text per document through memory, which is the same reason run
+   * events are trimmed rather than listed whole.
+   *
+   * `'simple'` is deliberate. The default Postgres configuration stems and
+   * stopwords, so searching for "the March invoice" would drop "the", and a
+   * document titled only "The…" would not match. With `simple` every token is
+   * indexed as written.
+   *
+   * Both the text and the query are bound parameters. `plainto_tsquery` is given
+   * the raw query string and does its own lexing, so an operator-sign sequence or
+   * a quote in the user's words cannot reach the parser as syntax.
+   */
+  async searchLibraryText<T = Record<string, unknown>>(
+    owner: string,
+    query: string,
+    limit: number,
+  ): Promise<T[]> {
+    const capped = Number.isFinite(limit) ? Math.max(1, Math.min(100, Math.floor(limit))) : 25;
+    const result = await this.db.query(
+      `SELECT meta.data FROM records meta
+       JOIN records body ON body.owner=meta.owner AND body.kind=$2 AND body.id=meta.id
+       WHERE meta.owner=$1 AND meta.kind=$3
+         AND to_tsvector('simple', coalesce(body.data->>'text','')) @@ plainto_tsquery('simple',$4)
+       ORDER BY meta.updated_at DESC,meta.id ASC
+       LIMIT $5`,
+      [owner, "library-text", "library", query, capped],
+    );
+    return result.rows.map((row) => row.data as T);
+  }
 }
 
 /** Idle clients can be disconnected by a database restart; without a listener pg's `error` event crashes the process. */
@@ -422,6 +572,23 @@ export async function createStore(
        RETURN v::timestamptz;
      EXCEPTION WHEN others THEN
        RETURN NULL;
+     END;
+     $$`,
+  );
+  // safe_bigint is the same guard for the library quota counter. Its input is a
+  // number this application wrote, but the counter row lives in jsonb exactly
+  // like every other record here, so a row that survived a restore, a hand edit
+  // or an older build could hold a non-numeric `used`. A bare ::bigint cast would
+  // then raise 22008 and take down every upload — including the ones that would
+  // have fit in the remaining space. Bad input yields 0, which is the honest
+  // answer for "how much has this owner used".
+  await database.query(
+    `CREATE OR REPLACE FUNCTION safe_bigint(v text) RETURNS bigint
+     LANGUAGE plpgsql STABLE AS $$
+     BEGIN
+       RETURN v::bigint;
+     EXCEPTION WHEN others THEN
+       RETURN 0;
      END;
      $$`,
   );
