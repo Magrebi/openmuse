@@ -295,6 +295,14 @@ export async function recogniseScannedPdf(
   const directory = await mkdtemp(join(tmpdir(), "openmuse-ocr-"));
   try {
     for (const page of pages) {
+      // Once aborted, stop entirely. Each remaining page would otherwise still
+      // spawn a `pdftoppm` and a `tesseract` that are killed the instant they
+      // start — up to forty pointless process launches on a twenty-page document,
+      // exactly during the shutdown that is trying to move quickly.
+      if (options.signal?.aborted) {
+        truncated = true;
+        continue;
+      }
       // A page with a usable text layer costs nothing, so it is never counted
       // against the page budget and never rendered.
       if (page.text.trim().length >= TEXT_LAYER_THRESHOLD) {
