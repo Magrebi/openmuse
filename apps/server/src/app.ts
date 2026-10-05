@@ -30,6 +30,8 @@ import { AppError } from "./errors.ts";
 import { Files } from "./files.ts";
 import { GoogleAuth } from "./google-auth.ts";
 import { LibraryService, MAX_PAGE_SIZE, SHARE_MAX_DAYS } from "./library.ts";
+import { backgroundFailure } from "./log.ts";
+import { createOcrQueue } from "./ocr-queue.ts";
 import { UndoQueue } from "./undo.ts";
 import { WorkspaceService } from "./workspace.ts";
 
@@ -48,10 +50,14 @@ export async function createApp(
   options: { docker?: DockerRunner } = {},
 ) {
   assertApiDeploymentConfig(config);
+  // The OCR queue is built before the services that enqueue onto it, and shared
+  // with the library so uploads, the background jobs and the status endpoint all
+  // see one queue.
+  const ocr = createOcrQueue(config);
   const auth = await createAuth(db, config),
     files = new Files(db, config, auth),
     google = new GoogleAuth(db, config),
-    library = new LibraryService(db, config),
+    library = new LibraryService(db, config, ocr),
     workspace = new WorkspaceService(db, config, files, google);
   const actions = new ActionService(db, {
     execute: (owner, input, connectionId, targetVersion) =>
@@ -141,6 +147,18 @@ export async function createApp(
       502,
     );
   });
+  // Start the OCR queue and pick up anything a previous process left pending.
+  // The resweep is durable-state recovery, not scheduling: the records say
+  // "pending" but nothing is working on them, so without it they would wait
+  // forever for a job that died with the last process.
+  ocr.start();
+  await library
+    .resweepPendingOcr()
+    .catch((error) => backgroundFailure("resweep pending ocr", error));
+  // Probe the engine after the server is listening: it spawns a process, and a
+  // status probe that blocked the first request would be a self-inflicted slow
+  // start.
+  void ocr.probe().catch((error) => backgroundFailure("probe ocr engine", error));
   app.get("/api/health", async (c) =>
     c.json({
       ok: true,
@@ -152,6 +170,9 @@ export async function createApp(
       // owner, which is the only workspace this endpoint can describe without a
       // session: it is reachable before anyone has signed in.
       workerLoad: await agent.load(LOCAL_OWNER),
+      // The OCR queue's depth, so an operator can see a backlog building without
+      // reading logs.
+      ocr: library.ocrStatus(),
     }),
   );
   let loginWindow = 0,
@@ -368,6 +389,14 @@ export async function createApp(
 
   app.post("/api/library", async (c) => {
     const owner = c.get("owner");
+    // A saturated OCR queue is reported before the body is read, so a backlog
+    // cannot be deepened by uploads that are never going to be scanned. The file
+    // limit is still the body's own answer if this passes.
+    if (library.ocrStatus().saturated)
+      throw new AppError(
+        "The document reader is busy with other uploads. Try again in a moment.",
+        429,
+      );
     const data = await c.req.parseBody();
     const file = data.file;
     if (!(file instanceof File)) throw new AppError("Choose a file to upload", 422);
@@ -380,6 +409,22 @@ export async function createApp(
       201,
     );
   });
+
+  /**
+   * The OCR queue's state, so a UI can show "reading…" on a pending document and
+   * explain a 429 rather than showing an opaque failure.
+   */
+  app.get("/api/library/ocr", (c) =>
+    c.json({
+      ...library.ocrStatus(),
+      limits: {
+        maxPages: config.libraryOcrMaxPages ?? 20,
+        pageTimeoutMs: config.libraryOcrPageTimeoutMs ?? 30_000,
+        documentTimeoutMs: config.libraryOcrDocumentTimeoutMs ?? 300_000,
+        maxInputBytes: config.libraryOcrMaxInputBytes ?? 25 * 1024 * 1024,
+      },
+    }),
+  );
 
   app.get("/api/library/search", async (c) => {
     const query = z
@@ -584,5 +629,5 @@ export async function createApp(
   app.get("/", (c) =>
     c.json({ name: "OpenMuse", app: "http://localhost:8081", health: "/api/health" }),
   );
-  return { app, auth, files, actions, workspace, agent, computer, browser, undo, library };
+  return { app, auth, files, actions, workspace, agent, computer, browser, undo, library, ocr };
 }

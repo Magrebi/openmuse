@@ -65,6 +65,23 @@ export interface Config {
    * Same optional-with-default shape as `libraryMaxFileBytes`.
    */
   libraryMaxTotalBytes?: number;
+  /** OCR language codes, from `LIBRARY_OCR_LANGS`. Default `eng+tur`. */
+  libraryOcrLangs?: string;
+  /** Scanned pages OCR'd per document, from `LIBRARY_OCR_MAX_PAGES`. Default 20. */
+  libraryOcrMaxPages?: number;
+  /** Wall-clock cap on one OCR'd page, in ms. Default 30s. */
+  libraryOcrPageTimeoutMs?: number;
+  /** Wall-clock cap on one document's whole OCR run, in ms. Default 300s. */
+  libraryOcrDocumentTimeoutMs?: number;
+  /**
+   * Concurrent OCR jobs. Past this, new uploads are told the queue is full
+   * rather than being accepted into a backlog that grows without bound.
+   */
+  libraryOcrConcurrency?: number;
+  /** Queued-but-not-started OCR jobs before uploads are refused. Default 8. */
+  libraryOcrMaxQueue?: number;
+  /** Largest input handed to OCR, in bytes, from `LIBRARY_OCR_MAX_INPUT_MB`. */
+  libraryOcrMaxInputBytes?: number;
   casaosApiUrl: string;
   casaosProtectedApps: string[];
   /** Opt out of the HTTPS/loopback transport policy (trusted LANs only). */
@@ -161,6 +178,58 @@ export function libraryLimits(env: Record<string, string | undefined> = process.
   };
 }
 
+/**
+ * Read the OCR knobs, with documented defaults.
+ *
+ * These are the values that bound the work a single hostile or merely enormous
+ * document can cause, so each one is validated rather than trusted:
+ *
+ * - `LIBRARY_OCR_MAX_PAGES` is clamped to at least 1. A 0 would silently disable
+ *   OCR while leaving the feature looking configured.
+ * - `LIBRARY_OCR_PAGE_TIMEOUT_MS` is floored at 1s, because a sub-second cap
+ *   fails every legitimate page and reports a working engine as broken.
+ * - `LIBRARY_OCR_CONCURRENCY` is capped at 4. Each job is a Tesseract process
+ *   holding a page raster in memory, so unbounded concurrency on a small box is a
+ *   way to run it out of RAM.
+ *
+ * As with the size limits, a blank or unparseable value falls back to the
+ * default rather than failing startup.
+ */
+export function ocrLimits(env: Record<string, string | undefined> = process.env): {
+  languages: string;
+  maxPages: number;
+  pageTimeoutMs: number;
+  documentTimeoutMs: number;
+  concurrency: number;
+  maxQueue: number;
+  maxInputBytes: number;
+} {
+  const integer = (name: string, fallback: number) => {
+    const raw = env[name]?.trim();
+    if (!raw) return fallback;
+    const value = Number(raw);
+    return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+  };
+  const megabytes = (name: string, fallback: number) => {
+    const raw = env[name]?.trim();
+    if (!raw) return fallback;
+    const value = Number(raw);
+    return Number.isFinite(value) && value > 0 ? Math.floor(value * 1024 * 1024) : fallback;
+  };
+  return {
+    languages: env.LIBRARY_OCR_LANGS?.trim() || "eng+tur",
+    maxPages: integer("LIBRARY_OCR_MAX_PAGES", 20),
+    pageTimeoutMs: Math.max(1000, integer("LIBRARY_OCR_PAGE_TIMEOUT_MS", 30_000)),
+    documentTimeoutMs: Math.max(5000, integer("LIBRARY_OCR_DOCUMENT_TIMEOUT_MS", 300_000)),
+    concurrency: Math.min(4, integer("LIBRARY_OCR_CONCURRENCY", 2)),
+    maxQueue: Math.min(50, integer("LIBRARY_OCR_MAX_QUEUE", 8)),
+    // An OCR input is rendered to a raster before it is recognised, so the input
+    // cap is well below the library's own 50 MB per-file cap: a 50 MB TIFF is
+    // only a few hundred KB as PNG, but as raw pixels it is gigabytes.
+    maxInputBytes: megabytes("LIBRARY_OCR_MAX_INPUT_MB", 25),
+  };
+}
+
 export function readConfig(): Config {
   const mode = process.env.WORKSPACE_MODE ?? "sample";
   if (mode !== "sample" && mode !== "live")
@@ -212,6 +281,7 @@ export function readConfig(): Config {
       return {
         libraryMaxFileBytes: limits.maxFileBytes,
         libraryMaxTotalBytes: limits.maxTotalBytes,
+        ...ocrLimits(),
       };
     })(),
     // M1: no default address. A hardcoded fallback committed one operator's LAN

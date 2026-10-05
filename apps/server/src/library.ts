@@ -32,6 +32,19 @@ import {
   safeFilename,
 } from "./library-format.ts";
 import { backgroundFailure } from "./log.ts";
+import { parseLanguages, recognise, recogniseScannedPdf, TEXT_LAYER_THRESHOLD } from "./ocr.ts";
+import type { OcrQueue } from "./ocr-queue.ts";
+
+/**
+ * The formats that always produce text without OCR, and the ones OCR can read.
+ *
+ * A document in the first set never queues an OCR job, so the overwhelmingly
+ * common case — a text PDF, a markdown note — costs exactly what it cost before.
+ */
+const ALWAYS_EXTRACTABLE = new Set(["text/plain", "text/markdown", "text/csv", "application/pdf"]);
+
+/** Image formats OCR reads directly. */
+const OCR_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp"]);
 
 /** Record kinds. Metadata and extracted text are separate so lists stay small. */
 const DOCS = "library";
@@ -81,6 +94,46 @@ export interface LibraryDocument {
   conversationId?: string;
   /** The task a generated document came from, when it came from one. */
   taskId?: string;
+  /**
+   * Where text extraction has got to.
+   *
+   * Additive and optional, so a record written by the build before OCR existed
+   * still reads correctly — it simply has no `extraction` field, which
+   * `extractionState` treats as "ready" for the formats that always extracted and
+   * "not applicable" for the ones that never did. No migration, and no existing
+   * row is rewritten.
+   *
+   * - `pending` — stored, and OCR is queued or running.
+   * - `ready`   — text is extracted and searchable.
+   * - `failed`  — OCR was attempted and produced no text. The document is still
+   *               stored and downloadable; only its text is missing.
+   * - `none`    — this format has no text layer and was not OCR'd (an office
+   *               document), or OCR is not configured.
+   */
+  extraction?: "pending" | "ready" | "failed" | "none";
+  /**
+   * True when the text came from OCR rather than a text layer.
+   *
+   * Surfaced in search results and in the attached block, because recognition is
+   * less reliable than extraction and the agent should hedge accordingly: a
+   * number it read from an OCR'd page may be a misread glyph.
+   */
+  ocr?: boolean;
+}
+
+/**
+ * How a document's text extraction has got to, normalised for a record that may
+ * predate the `extraction` field.
+ *
+ * A record with no field is "ready" if its format always had a text layer and
+ * "none" otherwise — which is exactly what the build before OCR would have
+ * produced, so an existing record reads correctly with no migration.
+ */
+export function extractionState(
+  document: Pick<LibraryDocument, "mimeType" | "extraction">,
+): "pending" | "ready" | "failed" | "none" {
+  if (document.extraction) return document.extraction;
+  return ALWAYS_EXTRACTABLE.has(document.mimeType) ? "ready" : "none";
 }
 
 /** What the list and search endpoints return: metadata only, never bytes. */
@@ -139,6 +192,15 @@ export class LibraryService {
   constructor(
     private readonly db: Store,
     private readonly config: Config,
+    /**
+     * The background OCR queue.
+     *
+     * Optional so the service still constructs without one — which keeps the
+     * pre-OCR behaviour available and lets tests exercise storage without
+     * recognition. With no queue a scanned document is stored and reported not
+     * extractable, exactly as the previous build did.
+     */
+    private readonly ocr?: OcrQueue,
   ) {
     this.maxFileBytes = this.config.libraryMaxFileBytes ?? 50 * 1024 * 1024;
     this.maxTotalBytes = this.config.libraryMaxTotalBytes ?? 1024 * 1024 * 1024;
@@ -241,7 +303,11 @@ export class LibraryService {
       };
       await this.db.put(owner, DOCS, document);
       await this.indexText(owner, id, input.bytes, mimeType);
-      return document;
+      // Re-read rather than returning `document`: indexing is what sets
+      // `extraction`, and returning the pre-index object would hand the caller a
+      // record with no extraction state — which for a scan reads as "ready with no
+      // text" instead of "being read right now".
+      return (await this.db.get<LibraryDocument>(owner, DOCS, id)) ?? document;
     } catch (error) {
       // Roll the whole write back. Quota first, then the partial directory: a
       // half-written file that outlives its record would silently consume the
@@ -395,6 +461,11 @@ export class LibraryService {
         truncated: cached.truncated === true,
         extractable: true,
       };
+    // Still running. Saying "pending" is the honest answer, and it is what the
+    // agent needs in order to tell the owner to wait rather than to report that
+    // the document has no text — which would be wrong for a scan that is
+    // mid-queue.
+    if (extractionState(document) === "pending") return notExtractable("document (OCR pending)");
     const { bytes } = await this.download(owner, id);
     return this.readText(document.mimeType, bytes);
   }
@@ -448,17 +519,276 @@ export class LibraryService {
   ): Promise<void> {
     try {
       const extracted = await this.readText(mimeType, bytes);
-      // An empty body would match no query and would make the JOIN in
-      // `searchLibraryText` pointless work, so only non-empty text is stored.
-      if (!extracted.extractable || !extracted.text) return await this.db.remove(owner, TEXTS, id);
-      await this.db.put(owner, TEXTS, {
-        id,
-        text: extracted.text,
-        truncated: extracted.truncated,
-      });
+      // A PDF needs OCR whenever its text layer does not cover *every* page. The
+      // obvious check — "did we get any text at all?" — is wrong for a hybrid
+      // document: one text page makes it true, the scanned pages are dropped, and
+      // the document silently loses half its content. So the decision is made
+      // per page, and the queued job is the thing that merges the two sources.
+      const needsOcr =
+        this.needsOcr(mimeType) &&
+        (mimeType !== "application/pdf" || (await this.pdfHasUnreadPages(bytes)));
+      if (needsOcr) {
+        const queued = this.enqueueOcr(owner, id);
+        await this.setExtraction(owner, id, queued ? "pending" : "failed");
+        return;
+      }
+      if (extracted.extractable && extracted.text) {
+        await this.writeIndex(owner, id, extracted.text, extracted.truncated, false);
+        return await this.setExtraction(owner, id, "ready", false);
+      }
+      // Nothing inline and nothing to OCR: a format with no text layer.
+      await this.db.remove(owner, TEXTS, id);
+      await this.setExtraction(owner, id, "none");
     } catch (error) {
       backgroundFailure("index library document text", error);
     }
+  }
+
+  /**
+   * Whether any page of a PDF yields too little text to be used as-is.
+   *
+   * A page is "covered" when its text layer clears `TEXT_LAYER_THRESHOLD`. A
+   * scanned page yields nothing; a page carrying only a header or a page number
+   * yields a handful. Those are the pages worth rendering.
+   *
+   * Best-effort by design: a PDF this cannot be parsed at all returns true, so it is
+   * queued for OCR rather than being written off as unreadable. OCR will fail on it
+   * too, and the record ends `failed` — which is the honest outcome, whereas
+   * silently accepting "no pages to OCR" would leave it looking ready with no text.
+   */
+  private async pdfHasUnreadPages(bytes: Uint8Array): Promise<boolean> {
+    try {
+      const pages = await readPdfText(bytes, { maxChars: MAX_EXTRACTED_CHARS });
+      if (!pages.length) return true;
+      return pages.some(
+        (page) => page.unextractable || page.text.trim().length < TEXT_LAYER_THRESHOLD,
+      );
+    } catch {
+      return true;
+    }
+  }
+
+  /**
+   * Whether this format could gain text from OCR.
+   *
+   * `application/pdf` is included because a scanned PDF is the main case; a PDF
+   * with a text layer never reaches OCR, because its inline extraction succeeds
+   * first. Office formats are excluded deliberately — reading them needs an OOXML
+   * parser, and OCR of a rendered spreadsheet page is not what an owner wants when
+   * they search for a row.
+   */
+  private needsOcr(mimeType: string): boolean {
+    return (
+      this.ocr !== undefined && (OCR_IMAGE_TYPES.has(mimeType) || mimeType === "application/pdf")
+    );
+  }
+
+  /**
+   * Put a document on the OCR queue, if there is room.
+   *
+   * Returns false when the queue is full or the document is already queued, and
+   * the caller records that as `failed` — the document is still stored and
+   * downloadable, it just will not become searchable. Refusing the *upload*
+   * instead would lose the owner's file over a transient queue depth, which is the
+   * wrong trade.
+   */
+  private enqueueOcr(owner: string, id: string): boolean {
+    if (!this.ocr) return false;
+    return this.ocr.enqueue({
+      owner,
+      documentId: id,
+      run: (signal) => this.runOcr(owner, id, signal),
+    });
+  }
+
+  /**
+   * Re-queue documents left `pending` by a restart.
+   *
+   * The queue lives in memory but the state does not, so a process that died
+   * mid-OCR leaves records saying "pending" with nothing working on them. Called
+   * once at startup, this puts them back on the queue. Without it a document would
+   * stay "pending" forever — the owner would be told it was being read, and it would
+   * never be.
+   *
+   * Only `pending` is swept. A `failed` document is not retried automatically: the
+   * failure was real, and silently re-running it on every restart would turn one
+   * corrupt file into a job that never stops being scheduled. The owner can re-upload
+   * or the agent can retry explicitly.
+   */
+  async resweepPendingOcr(): Promise<number> {
+    if (!this.ocr) return 0;
+    let requeued = 0;
+    for (const owner of await this.db.owners()) {
+      // Paged, because a document left pending past the first page would otherwise
+      // be stranded: the owner would be told it was being read, and never would be.
+      for (let offset = 0; ; offset += 100) {
+        const page = await this.list(owner, { limit: 100, offset });
+        if (!page.documents.length) break;
+        for (const document of page.documents)
+          if (extractionState(document) === "pending" && this.enqueueOcr(owner, document.id))
+            requeued++;
+        if (page.documents.length < 100) break;
+      }
+    }
+    return requeued;
+  }
+
+  /** The OCR queue's current state, for the health and list endpoints. */
+  ocrStatus() {
+    return this.ocr?.status ?? { running: 0, queued: 0, saturated: false, languages: [] };
+  }
+
+  /** Update only the extraction fields, leaving the rest of the record alone. */
+  private async setExtraction(
+    owner: string,
+    id: string,
+    extraction: LibraryDocument["extraction"],
+    ocr?: boolean,
+  ): Promise<void> {
+    const existing = await this.db.get<LibraryDocument>(owner, DOCS, id);
+    if (!existing) return;
+    await this.db.put(owner, DOCS, {
+      ...existing,
+      extraction,
+      ...(ocr === undefined ? {} : { ocr }),
+    });
+  }
+
+  /**
+   * Write the searchable text for a document.
+   *
+   * An empty body is removed rather than stored: it would match no query and
+   * would make the JOIN in `searchLibraryText` do pointless work. `ocr` rides on
+   * the same row so search can tell the owner that a hit came from recognition,
+   * which is less reliable than extraction.
+   */
+  private async writeIndex(
+    owner: string,
+    id: string,
+    text: string,
+    truncated: boolean,
+    ocr: boolean,
+  ): Promise<void> {
+    if (!text.trim()) return await this.db.remove(owner, TEXTS, id);
+    await this.db.put(owner, TEXTS, { id, text, truncated, ocr });
+  }
+
+  /**
+   * The OCR job body: recognise a document and index what came out.
+   *
+   * Everything here is bounded and every failure ends in a durable state rather
+   * than a throw that leaves a record stuck at "pending" forever:
+   *
+   * - **Input size.** A cap is checked before anything is rendered. A giant image
+   *   becomes a memory bomb at render time, long after the upload was accepted.
+   * - **Page and document timeouts.** Enforced by the subprocess layer, which
+   *   SIGKILLs, so a wedged Tesseract releases its slot instead of holding it.
+   * - **Failure.** The record becomes `failed` and any engine detail goes to the
+   *   background log, never to the owner and never into the record. A document
+   *   that fails to OCR is still a stored, downloadable document.
+   */
+  private async runOcr(
+    owner: string,
+    id: string,
+    signal: AbortSignal,
+  ): Promise<{ text: string; truncated: boolean; ocr: boolean }> {
+    const document = await this.db.get<LibraryDocument>(owner, DOCS, id);
+    // The document may have been deleted between enqueue and execution.
+    if (!document) return { text: "", truncated: false, ocr: true };
+    try {
+      const maxInput = this.config.libraryOcrMaxInputBytes ?? 25 * 1024 * 1024;
+      if (document.sizeBytes > maxInput) {
+        backgroundFailure(
+          `ocr ${id}`,
+          new Error(`input ${document.sizeBytes} bytes exceeds the OCR input cap`),
+        );
+        await this.setExtraction(owner, id, "failed");
+        return { text: "", truncated: false, ocr: true };
+      }
+      // The path comes from the stored record, never from a request: `documentPath`
+      // rebuilds it from the owner, the id and the sanitised filename.
+      const path = documentPath(this.config.dataDir, owner, document.id, document.filename);
+      const languages = parseLanguages(this.config.libraryOcrLangs);
+      const text =
+        document.mimeType === "application/pdf"
+          ? await this.ocrPdf(path, languages, signal)
+          : await this.ocrImage(path, languages, signal);
+      if (!text.text.trim()) {
+        // No text is a failure, not an empty success: the owner asked for a
+        // searchable document and did not get one, and `failed` says so.
+        await this.db.remove(owner, TEXTS, id);
+        await this.setExtraction(owner, id, "failed");
+        return { text: "", truncated: false, ocr: true };
+      }
+      await this.writeIndex(owner, id, text.text, text.truncated, text.ocr);
+      await this.setExtraction(owner, id, "ready", text.ocr);
+      return { text: text.text, truncated: text.truncated, ocr: text.ocr };
+    } catch (error) {
+      backgroundFailure(`ocr ${id}`, error);
+      await this.db.remove(owner, TEXTS, id).catch(() => {});
+      await this.setExtraction(owner, id, "failed").catch(() => {});
+      return { text: "", truncated: false, ocr: true };
+    }
+  }
+
+  /**
+   * OCR a PDF: keep the text layer where there is one, recognise the rest.
+   *
+   * This is what makes a hybrid document work. A page whose text layer yields a
+   * usable amount of text is kept verbatim — it is exact, and re-recognising it
+   * would be both slower and less accurate. Only the pages that come back empty
+   * are rendered and OCR'd, and the two sources are concatenated in page order.
+   */
+  private async ocrPdf(
+    path: string,
+    languages: string,
+    signal: AbortSignal,
+  ): Promise<{ text: string; truncated: boolean; ocr: boolean }> {
+    // Re-read the text layer here rather than trusting the upload-time result:
+    // the upload path discarded it, and the per-page detail is what tells OCR
+    // which pages actually need it.
+    const bytes = new Uint8Array(await readFile(path));
+    const pages = await readPdfText(bytes, { maxChars: MAX_EXTRACTED_CHARS }).catch(() => []);
+    const recognised = await recogniseScannedPdf(
+      path,
+      pages.map((page) => ({ page: page.page, text: page.text })),
+      languages,
+      {
+        maxPages: this.config.libraryOcrMaxPages ?? 20,
+        pageTimeoutMs: this.config.libraryOcrPageTimeoutMs ?? 30_000,
+        documentTimeoutMs: this.config.libraryOcrDocumentTimeoutMs ?? 300_000,
+        renderDpi: 200,
+        signal,
+      },
+    );
+    const usedOcr = recognised.pages.some((page) => page.ocr);
+    return {
+      text: recognised.pages
+        .map((page) => page.text.trim())
+        .filter(Boolean)
+        .join("\n\n"),
+      truncated: recognised.truncated,
+      // A hybrid document is flagged as OCR-derived because *part* of it was
+      // recognised: the flag tells the agent to hedge, and hedging is correct for
+      // the recognised pages if not for the others. Reporting "false" because two
+      // of four pages had a text layer would understate the uncertainty.
+      ocr: usedOcr,
+    };
+  }
+
+  /** OCR one image file straight through Tesseract. */
+  private async ocrImage(
+    path: string,
+    languages: string,
+    signal: AbortSignal,
+  ): Promise<{ text: string; truncated: boolean; ocr: boolean }> {
+    const result = await recognise(path, languages, {
+      timeoutMs: this.config.libraryOcrPageTimeoutMs ?? 30_000,
+      signal,
+    });
+    if (!result.ok) throw new Error(`OCR did not complete: ${result.reason ?? "unknown"}`);
+    const capped = capText(result.text.trim());
+    return { text: capped.text, truncated: capped.truncated, ocr: true };
   }
 
   /* ---------------------------------------------------------------- retrieval */
@@ -487,10 +817,15 @@ export class LibraryService {
   async attach(owner: string, id: string) {
     const document = await this.get(owner, id);
     const extracted = await this.extract(owner, id);
+    const state = extractionState(document);
     return {
       document,
       extractable: extracted.extractable,
       truncated: extracted.truncated,
+      /** Where the text came from, so the agent can hedge on a recognised page. */
+      ocr: document.ocr === true,
+      /** `pending`, `ready`, `failed` or `none`, for the agent's own reporting. */
+      extraction: state,
       ...(extracted.note ? { note: extracted.note } : {}),
       content: extracted.extractable
         ? documentBlock({
@@ -499,6 +834,7 @@ export class LibraryService {
             mimeType: document.mimeType,
             text: extracted.text,
             truncated: extracted.truncated,
+            ocr: document.ocr === true,
           })
         : undefined,
     };
