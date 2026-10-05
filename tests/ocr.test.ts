@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
@@ -122,7 +121,6 @@ async function waitForOcr(id: string, timeoutMs = 120_000): Promise<void> {
  * reading back an HTTP upload under any other name is a 404, not a slow poll.
  */
 const owner = "local-user";
-const text = (s: string) => new TextEncoder().encode(s);
 
 /* ============ 1. the engine, its languages and argv-only invocation ============ */
 
@@ -226,11 +224,7 @@ async function waitForRecord(
 describe("a scanned document", () => {
   ocrTest("a scanned PDF is recognised, indexed and searchable by content", async () => {
     const pdf = await scannedPdf([["INVOICE NUMBER 4471", "TOTAL DUE 128.40 GBP"]]);
-    const { id, pendingAtUpload } = await uploadAndSettle(
-      "march-invoice.pdf",
-      pdf,
-      "application/pdf",
-    );
+    const { id } = await uploadAndSettle("march-invoice.pdf", pdf, "application/pdf");
     const record = await server.library.get(owner, id);
     assert.equal(record.extraction, "ready", "the record never reached ready");
     assert.equal(record.ocr, true, "the record is not flagged as OCR-derived");
@@ -529,7 +523,7 @@ describe("the OCR queue", () => {
     // silently win.
     const queue = new OcrQueue(1, 8, "eng");
     let started = 0;
-    let release: (() => void) | undefined;
+    let release = () => {};
     const gate = new Promise<void>((resolve) => {
       release = resolve;
     });
@@ -546,7 +540,7 @@ describe("the OCR queue", () => {
     await new Promise((resolve) => setTimeout(resolve, 10));
     // Now it is running, and the same document must not be queued again.
     assert.equal(queue.enqueue(job), false, "a running document was queued twice");
-    release!();
+    release();
     await new Promise((resolve) => setTimeout(resolve, 20));
     await queue.stop();
     assert.equal(started, 1, `the job ran ${started} times`);
@@ -556,7 +550,7 @@ describe("the OCR queue", () => {
     // An unbounded backlog is how a memory limit gets found. The guard reports
     // saturation so the upload route can answer 429.
     const queue = new OcrQueue(1, 2, "eng");
-    let release: (() => void) | undefined;
+    let release = () => {};
     const gate = new Promise<void>((resolve) => {
       release = resolve;
     });
@@ -574,7 +568,7 @@ describe("the OCR queue", () => {
     assert.equal(queue.saturated, true, "a depth-2 queue did not report saturation");
     // The third is refused rather than queued, which is what the 429 is for.
     assert.equal(queue.enqueue(slow("c")), false, "work was accepted past the depth limit");
-    release!();
+    release();
     await queue.stop();
   });
 
