@@ -8,6 +8,7 @@ import { emailDraftSchema, eventDraftSchema } from "../../../../packages/domain/
 import { assertCasaOSAppAllowed } from "../casaos.ts";
 import { casaOSCredentialsConfigured } from "../casaos-credentials.ts";
 import { computerInstructions, computerTools } from "../computer-tools.ts";
+import { libraryTools } from "../library-tools.ts";
 import {
   BROWSER_INPUT_BUDGET,
   BrowserInputGuard,
@@ -432,6 +433,17 @@ export async function executeModelTask(
         await ctx.guard();
       },
     }),
+    ...libraryTools(
+      service.library,
+      owner,
+      { taskId: task.id },
+      {
+        before: async () => {
+          if (outcome) throw new Error("Task is waiting or finished; do not perform more actions");
+          await ctx.guard();
+        },
+      },
+    ),
     ...casaOSTools,
     tool(
       "set_plan",

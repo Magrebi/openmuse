@@ -8,6 +8,7 @@ import { createApp } from "../apps/server/src/app.ts";
 import type { Config } from "../apps/server/src/config.ts";
 import { createStore, type Store } from "../apps/server/src/db.ts";
 import { MAX_EXTRACTED_CHARS } from "../apps/server/src/library-format.ts";
+import { libraryTools } from "../apps/server/src/library-tools.ts";
 
 const MB = 1024 * 1024;
 
@@ -664,4 +665,109 @@ test("a binary format reports no extractable text instead of returning garbage",
       assert.equal(response.status, 401, `${method} ${path} was reachable without a session`);
     }
   });
+});
+/* ============ 11. the agent's library tools ============ */
+
+/** Run one of the library tools the way the model runtime would. */
+function tool(owner: string, name: string, args: unknown, provenance = {}) {
+  const built = libraryTools(server.library, owner, provenance);
+  const found = built.find((t) => t.name === name);
+  assert.ok(found, `no tool named ${name}`);
+  return found.execute(args, {} as never);
+}
+
+test("the agent can search, attach, and save a document", async () => {
+  const toolOwner = "tool-owner";
+  await server.library.upload(toolOwner, {
+    filename: "lease.txt",
+    declaredType: "text/plain",
+    bytes: text("The lease runs to 30 September and costs 850 per month."),
+  });
+
+  // Search by content, through the tool the model actually calls.
+  const found = (await tool(toolOwner, "library_search", { query: "850 per month" })) as {
+    documents: { id: string; filename: string }[];
+  };
+  assert.equal(found.documents.length, 1);
+  assert.equal(found.documents[0].filename, "lease.txt");
+
+  // Attach it into the turn as fenced content.
+  const attached = (await tool(toolOwner, "library_attach", {
+    documentId: found.documents[0].id,
+  })) as { content?: string; extractable: boolean };
+  assert.equal(attached.extractable, true);
+  assert.match(attached.content ?? "", /BEGIN_UNTRUSTED_DOCUMENT_CONTENT/);
+  assert.match(attached.content ?? "", /850 per month/);
+
+  // Save a deliverable; it lands in the library as a generated document with the
+  // conversation recorded, so the owner can find it later by meaning.
+  const saved = (await tool(
+    toolOwner,
+    "library_save_document",
+    {
+      filename: "lease-summary",
+      content: "# Lease\nEnds 30 September.",
+      format: "md",
+      label: "Lease summary",
+    },
+    { conversationId: "thread-7" },
+  )) as { id: string; source: string; label: string; conversationId: string };
+  assert.equal(saved.source, "generated");
+  assert.equal(saved.label, "Lease summary");
+  assert.equal(saved.conversationId, "thread-7");
+
+  const listed = await server.library.list(toolOwner);
+  assert.equal(listed.documents.length, 2);
+  assert.equal(listed.total, 2);
+  for (const document of listed.documents) await server.library.delete(toolOwner, document.id);
+});
+
+test("a tool error is returned as a readable value, not a thrown failure", async () => {
+  // A tool call that throws aborts the model run; one that returns an error lets
+  // the agent recover and tell the owner what happened.
+  const result = (await tool("tool-owner", "library_attach", {
+    documentId: "11111111-2222-3333-4444-555555555555",
+  })) as { error?: string };
+  assert.match(result.error ?? "", /not found/i);
+});
+
+test("an agent tool cannot read another owner's document", async () => {
+  const ownerA = "tool-a";
+  const stored = await server.library.upload(ownerA, {
+    filename: "private.txt",
+    declaredType: "text/plain",
+    bytes: text("private notes"),
+  });
+  // The tool takes its owner from the run, not from the arguments, so a document
+  // id from elsewhere resolves as a miss rather than as a read.
+  const result = (await tool("tool-b", "library_attach", { documentId: stored.id })) as {
+    error?: string;
+    content?: string;
+  };
+  assert.match(result.error ?? "", /not found/i);
+  assert.equal(result.content, undefined);
+  await server.library.delete(ownerA, stored.id);
+});
+
+test("a generated tool document still goes through the type allowlist", async () => {
+  // The tool builds the bytes, but the service's sniffing is the final word: a
+  // deliverable is not exempt because the agent produced it. An `.html` name is
+  // refused even though the tool was the one that chose it.
+  const refused = (await tool("tool-owner", "library_save_document", {
+    filename: "report.html",
+    content: "<script>alert(1)</script>",
+    format: "md",
+  })) as { error?: string };
+  assert.match(refused.error ?? "", /Accepted here/);
+
+  // And a name with no extension gets the declared format's extension appended,
+  // so a legitimate deliverable still lands.
+  const saved = (await tool("tool-owner", "library_save_document", {
+    filename: "no-extension",
+    content: "# Title\nBody.",
+    format: "md",
+  })) as { id: string; filename: string; mimeType: string };
+  assert.equal(saved.filename, "no-extension.md");
+  assert.equal(saved.mimeType, "text/markdown");
+  await server.library.delete("tool-owner", saved.id);
 });
