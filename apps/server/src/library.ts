@@ -324,7 +324,11 @@ export class LibraryService {
     if (!removed) throw new AppError("Document not found", 404);
     await Promise.all([
       this.db.remove(owner, TEXTS, document.id),
-      this.db.remove(owner, SHARES, document.id),
+      // Withdraw the share token explicitly. Relying on `resolveShare`'s
+      // subsequent 404 would leave a token row pointing at a document that is
+      // gone — harmless to serve but a live credential outliving its subject, and
+      // the kind of row nothing else ever collects.
+      this.withdrawTokens(document.id),
       this.release(owner, removed.sizeBytes),
       rm(documentPath(this.config.dataDir, owner, document.id, removed.filename), {
         force: true,
@@ -525,12 +529,17 @@ export class LibraryService {
     days = SHARE_DEFAULT_DAYS,
   ): Promise<{ token: string; url: string; expiresAt: string; days: number }> {
     await this.get(owner, id);
-    const span = Math.max(1, Math.min(SHARE_MAX_DAYS, Math.floor(days)));
+    // A non-finite or out-of-range `days` is clamped rather than propagated:
+    // `Math.min(30, NaN)` is NaN, and `new Date(NaN).toISOString()` throws, which
+    // would turn a bad argument into a 500 on a call the owner can reach.
+    const requested = Number.isFinite(days) ? Math.floor(days) : SHARE_DEFAULT_DAYS;
+    const span = Math.max(1, Math.min(SHARE_MAX_DAYS, requested));
     const token = randomBytes(32).toString("base64url");
     const expiresAt = new Date(Date.now() + span * 86400_000).toISOString();
     // One live link per document: re-sharing replaces the previous token rather
-    // than accumulating links the owner has forgotten about. The owner's own
-    // record is what `revokeShare` deletes, so keep both in step.
+    // than accumulating links the owner has forgotten about. Withdraw any token
+    // this document already had, so exactly one is ever live.
+    await this.withdrawTokens(id);
     await this.db.put(SHARE_SCOPE, SHARES, {
       id: tokenDigest(token),
       owner,
@@ -539,18 +548,26 @@ export class LibraryService {
       expiresAt,
       days: span,
     });
-    await this.db.put(owner, SHARES, { id, createdAt: new Date().toISOString(), expiresAt });
     return { token, url: `${this.config.publicUrl}/s/${token}`, expiresAt, days: span };
+  }
+
+  /**
+   * Delete every token row naming a document.
+   *
+   * The token row is keyed by digest rather than by document, so this is a scan of
+   * the share scope. That is proportional to how many shares exist, not to the
+   * library, and this deployment has one owner with a handful of links — a
+   * secondary index would be the right answer at a scale where the scan showed up.
+   */
+  private async withdrawTokens(documentId: string): Promise<void> {
+    for (const share of await this.db.list<ShareRow>(SHARE_SCOPE, SHARES))
+      if (share.documentId === documentId) await this.db.remove(SHARE_SCOPE, SHARES, share.id);
   }
 
   /** Withdraw a document's share link. Revoked links 404 like expired ones. */
   async revokeShare(owner: string, id: string): Promise<void> {
     await this.get(owner, id);
-    await this.db.remove(owner, SHARES, id);
-    // The token row names its document, so the owner's row is what tells us
-    // which token digest to withdraw.
-    for (const share of await this.db.list<ShareRow>(SHARE_SCOPE, SHARES))
-      if (share.documentId === id) await this.db.remove(SHARE_SCOPE, SHARES, share.id);
+    await this.withdrawTokens(id);
   }
 
   /**
