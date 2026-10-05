@@ -82,10 +82,10 @@ block = """
 # lets a base-image bump quietly change which engine a rebuild gets.
 RUN apt-get update \\
  && apt-get install -y --no-install-recommends \\
-      tesseract-ocr=5.3.4-1 \\
-      tesseract-ocr-eng=1.12-1 \\
-      tesseract-ocr-tur=1.12-1 \\
-      poppler-utils=24.02.0-0 \\
+      tesseract-ocr=5.3.0-2 \\
+      tesseract-ocr-eng=1:4.1.0-2 \\
+      tesseract-ocr-tur=1:4.1.0-2 \\
+      poppler-utils \\
  && rm -rf /var/lib/apt/lists/* \\
  && tesseract --list-langs 2>&1 | grep -qx eng \\
  && tesseract --list-langs 2>&1 | grep -qx tur
@@ -143,28 +143,31 @@ done
 # The access key is read into a variable and used, never echoed. `set -x` is never on.
 KEY=$(grep -E '^OPENMUSE_ACCESS_KEY=' "$APP_DIR/.env" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"')
 [ -n "$KEY" ] || { rollback; die "could not read OPENMUSE_ACCESS_KEY from $APP_DIR/.env"; }
+TOKEN=$(smoke -X POST -H 'Content-Type: application/json' -d '{"accessKey":"'"$KEY"'"}' "$BASE/api/session" | sed 's/.*"token":"//;s/".*//')
+[ -n "$TOKEN" ] || { rollback; die "smoke login failed: no session token"; }
+log "smoke: session acquired"
 BASE="http://127.0.0.1:$API_PORT"
 smoke() { curl -sS --max-time 30 "$@" 2>&1; }
 
 log "smoke: health"
-smoke -H "Authorization: Bearer $KEY" "$BASE/api/health" | head -c 400; echo
+smoke -H "Authorization: Bearer $TOKEN" "$BASE/api/health" | head -c 400; echo
 
 log "smoke: library upload -> list -> download -> delete"
 printf 'DEPLOY SMOKE TEST\nInvoice 12345 total 99.00\n' > /tmp/library-smoke.txt
-UP=$(smoke -X POST -H "Authorization: Bearer $KEY" \
+UP=$(smoke -X POST -H "Authorization: Bearer $TOKEN" \
       -F "file=@/tmp/library-smoke.txt;type=text/plain" "$BASE/api/library")
 DOC=$(printf '%s' "$UP" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
 [ -n "$DOC" ] || { rollback; die "library upload failed: $UP"; }
 log "  uploaded $DOC"
-smoke -H "Authorization: Bearer $KEY" "$BASE/api/library" | grep -q "$DOC" ||
+smoke -H "Authorization: Bearer $TOKEN" "$BASE/api/library" | grep -q "$DOC" ||
   { rollback; die "the uploaded document is not in the list"; }
 log "  listed"
-smoke -H "Authorization: Bearer $KEY" "$BASE/api/library/$DOC/content" | grep -q 'DEPLOY SMOKE TEST' ||
+smoke -H "Authorization: Bearer $TOKEN" "$BASE/api/library/$DOC/content" | grep -q 'DEPLOY SMOKE TEST' ||
   { rollback; die "download did not return the stored bytes"; }
 log "  downloaded"
-smoke -X DELETE -H "Authorization: Bearer $KEY" "$BASE/api/library/$DOC" | grep -q 'deleted' ||
+smoke -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/library/$DOC" | grep -q 'deleted' ||
   { rollback; die "delete failed"; }
-if smoke -H "Authorization: Bearer $KEY" "$BASE/api/library" | grep -q "$DOC"; then
+if smoke -H "Authorization: Bearer $TOKEN" "$BASE/api/library" | grep -q "$DOC"; then
   rollback; die "the document is still listed after deletion"
 fi
 log "  deleted and confirmed gone"
@@ -173,7 +176,7 @@ log "  deleted and confirmed gone"
 # catch an image built without the packages, which would otherwise look healthy
 # while every scanned document silently failed.
 log "smoke: OCR engine"
-LANGS=$(smoke -H "Authorization: Bearer $KEY" "$BASE/api/library/ocr" |
+LANGS=$(smoke -H "Authorization: Bearer $TOKEN" "$BASE/api/library/ocr" |
   sed -n 's/.*"languages":\[\([^]]*\)\].*/\1/p')
 log "  languages reported: ${LANGS:-none}"
 case "$LANGS" in
