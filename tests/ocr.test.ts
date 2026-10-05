@@ -659,7 +659,71 @@ test("the OCR modules make no outbound call", async () => {
   }
 });
 
-/* ============ 9. restart recovery ============ */
+/* ============ 10. deletion races an in-flight OCR ============ */
+
+ocrTest("deleting a document mid-OCR leaves no orphaned index row", async () => {
+  // The OCR job reads its record, spends seconds in the engine, and only then
+  // writes the index. A delete landing inside that window used to leave a
+  // `library-text` row behind for a document that no longer exists: invisible to
+  // search (the query joins on the metadata row) but never collected, so a
+  // long-running library accumulated dead rows one per raced deletion.
+  //
+  // The timing has to be forced. Deleting while the job is merely *queued* does
+  // not reproduce it — the engine then fails to open the deleted file and the
+  // error path cleans up after itself. So this waits until a job is genuinely
+  // running, and uses a multi-page document so recognition is still in flight when
+  // the delete lands.
+  const slowStore = await createStore({ dataDir: join(directory, "race-db") });
+  const slowServer = await createApp(slowStore, config(directory));
+  try {
+    const pdf = await scannedPdf([
+      ["RACE PAGE ONE ALPHA 6161"],
+      ["RACE PAGE TWO BRAVO 7272"],
+      ["RACE PAGE THREE CHARLIE 8383"],
+      ["RACE PAGE FOUR DELTA 9494"],
+    ]);
+    const stored = await slowServer.library.upload("race-user", {
+      filename: "racing.pdf",
+      bytes: pdf,
+    });
+    // Wait until a job is actually executing, then let it get into the engine.
+    const deadline = Date.now() + 30_000;
+    while (slowServer.ocr.status.running === 0 && Date.now() < deadline)
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(slowServer.ocr.status.running, 1, "OCR never started");
+    await new Promise((resolve) => setTimeout(resolve, 700));
+
+    await slowServer.library.delete("race-user", stored.id);
+
+    // The delete aborts the in-flight job rather than letting it finish against a
+    // document that is gone.
+    const stopDeadline = Date.now() + 5000;
+    while (slowServer.ocr.status.running > 0 && Date.now() < stopDeadline)
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(
+      slowServer.ocr.status.running,
+      0,
+      "the in-flight job kept running after the document was deleted",
+    );
+
+    // And whatever the job managed to write, none of it outlives the record.
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    assert.equal(
+      await slowStore.get("race-user", "library", stored.id),
+      null,
+      "the metadata record came back",
+    );
+    assert.equal(
+      await slowStore.get("race-user", "library-text", stored.id),
+      null,
+      "an orphaned index row outlived the deleted document",
+    );
+  } finally {
+    await slowServer.ocr.stop();
+    await slowServer.agent.stop();
+    await slowStore.close();
+  }
+});
 
 test("a record left pending by a crash is re-queued, not stranded", async () => {
   // The queue is in memory but the state is durable, so a process that died

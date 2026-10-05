@@ -384,6 +384,14 @@ export class LibraryService {
    */
   async delete(owner: string, id: string): Promise<void> {
     const document = await this.get(owner, id);
+    // Stop any recognition still working on this document before removing its
+    // record. Two reasons, and the second is the important one: it saves the work,
+    // and it closes the window in which an OCR job that has already read the file
+    // finishes and writes an index row for a document that no longer exists. Such
+    // a row is invisible to search (the query joins on the metadata record) but is
+    // never collected, so a long-lived library would accumulate one per raced
+    // deletion.
+    this.ocr?.abort(document.id);
     // `take` is DELETE ... RETURNING: exactly one caller can win, so two
     // concurrent deletes cannot both remove the record and both free the quota.
     const removed = await this.db.take<LibraryDocument>(owner, DOCS, document.id);
@@ -718,6 +726,15 @@ export class LibraryService {
         // searchable document and did not get one, and `failed` says so.
         await this.db.remove(owner, TEXTS, id);
         await this.setExtraction(owner, id, "failed");
+        return { text: "", truncated: false, ocr: true };
+      }
+      // Last check before writing, because recognition took seconds and a delete
+      // may have landed in that window. `delete` aborts the job, which closes most
+      // of it; this closes the rest. Without it a delete that arrives after the
+      // engine has already read the file leaves an index row for a document that no
+      // longer exists — invisible to search, but never collected.
+      if (!(await this.db.get(owner, DOCS, id))) {
+        await this.db.remove(owner, TEXTS, id);
         return { text: "", truncated: false, ocr: true };
       }
       await this.writeIndex(owner, id, text.text, text.truncated, text.ocr);
