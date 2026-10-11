@@ -1440,21 +1440,29 @@ test("db.claim returns null on malformed expiresAt instead of throwing", async (
   await db.put(owner, "actions", {
     id: "corrupt-1",
     status: "awaiting_review",
+    hash: "review-hash",
     expiresAt: "garbage",
     kind: "casaos.action",
     data: {},
   });
-  const claimed = await db.claim(owner, "corrupt-1", "executing", new Date().toISOString());
+  const claimed = await db.claim(
+    owner,
+    "corrupt-1",
+    "executing",
+    new Date().toISOString(),
+    "review-hash",
+  );
   assert.equal(claimed, null);
   // Positive control: a well-formed record still claims.
   await db.put(owner, "actions", {
     id: "valid-1",
     status: "awaiting_review",
+    hash: "review-hash",
     expiresAt: new Date(Date.now() + 60_000).toISOString(),
     kind: "casaos.action",
     data: {},
   });
-  const ok = await db.claim(owner, "valid-1", "executing", new Date().toISOString());
+  const ok = await db.claim(owner, "valid-1", "executing", new Date().toISOString(), "review-hash");
   assert.ok(ok, "valid record should claim");
 });
 
@@ -1630,11 +1638,18 @@ test("db.claim treats out-of-range timestamps as non-matching", async () => {
   await db.put(owner, "actions", {
     id: "bad-month",
     status: "awaiting_review",
+    hash: "review-hash",
     expiresAt: "2026-13-45T00:00:00Z",
     kind: "casaos.action",
     data: {},
   });
-  const claimed = await db.claim(owner, "bad-month", "executing", new Date().toISOString());
+  const claimed = await db.claim(
+    owner,
+    "bad-month",
+    "executing",
+    new Date().toISOString(),
+    "review-hash",
+  );
   assert.equal(claimed, null);
 });
 
@@ -1653,11 +1668,12 @@ test("db.claim never throws on out-of-range or garbage expiresAt", async () => {
     await db.put(owner, "actions", {
       id,
       status: "awaiting_review",
+      hash: "review-hash",
       kind: "casaos.action",
       expiresAt,
       data: { app: "plex" },
     });
-    const claimed = await db.claim(owner, id, "executing", new Date().toISOString());
+    const claimed = await db.claim(owner, id, "executing", new Date().toISOString(), "review-hash");
     assert.equal(claimed, null, `malformed expiresAt must be skipped: ${expiresAt}`);
   }
 });
@@ -1680,6 +1696,7 @@ test("a malformed expiry does not block a well-formed claim in the same statemen
   await db.put(owner, "actions", {
     id: "poison",
     status: "awaiting_review",
+    hash: "review-hash",
     expiresAt: "2026-13-45T00:00:00Z",
     kind: "casaos.action",
     data: { app: "plex" },
@@ -1687,12 +1704,13 @@ test("a malformed expiry does not block a well-formed claim in the same statemen
   await db.put(owner, "actions", {
     id: "healthy",
     status: "awaiting_review",
+    hash: "review-hash",
     expiresAt: new Date(Date.now() + 600_000).toISOString(),
     kind: "casaos.action",
     data: { app: "plex" },
   });
   assert.equal(
-    await db.claim(owner, "poison", "executing", new Date().toISOString()),
+    await db.claim(owner, "poison", "executing", new Date().toISOString(), "review-hash"),
     null,
     "the malformed row is skipped, not claimed",
   );
@@ -1701,6 +1719,7 @@ test("a malformed expiry does not block a well-formed claim in the same statemen
     "healthy",
     "executing",
     new Date().toISOString(),
+    "review-hash",
   );
   assert.equal(claimed?.status, "executing", "the healthy review still claims cleanly");
 });
@@ -1712,12 +1731,13 @@ test("a CasaOS action claims only for its own owner", async () => {
   await db.put(owner, "actions", {
     id: "shared-id",
     status: "awaiting_review",
+    hash: "review-hash",
     expiresAt,
     kind: "casaos.action",
     data: { app: "plex" },
   });
   assert.equal(
-    await db.claim(other, "shared-id", "executing", new Date().toISOString()),
+    await db.claim(other, "shared-id", "executing", new Date().toISOString(), "review-hash"),
     null,
     "another owner cannot claim a CasaOS action by guessing its id",
   );
@@ -1726,6 +1746,7 @@ test("a CasaOS action claims only for its own owner", async () => {
     "shared-id",
     "executing",
     new Date().toISOString(),
+    "review-hash",
   );
   assert.equal(claimed?.status, "executing");
 });
@@ -1735,11 +1756,15 @@ test("an expired CasaOS review is not claimable, and the claim is a no-op", asyn
   await db.put(owner, "actions", {
     id: "stale",
     status: "awaiting_review",
+    hash: "review-hash",
     expiresAt: new Date(Date.now() - 60_000).toISOString(),
     kind: "casaos.action",
     data: { app: "plex" },
   });
-  assert.equal(await db.claim(owner, "stale", "executing", new Date().toISOString()), null);
+  assert.equal(
+    await db.claim(owner, "stale", "executing", new Date().toISOString(), "review-hash"),
+    null,
+  );
   const still = await db.get<{ status: string }>(owner, "actions", "stale");
   assert.equal(still?.status, "awaiting_review", "the row is left untouched, not mutated");
 });

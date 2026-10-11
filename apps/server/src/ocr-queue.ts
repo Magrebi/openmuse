@@ -47,6 +47,14 @@ export interface OcrJob {
   ) => Promise<{ text: string; truncated: boolean; ocr: boolean }>;
 }
 
+/** Distinguishes recoverable shutdown from a document deletion or engine failure. */
+export class OcrShutdownError extends Error {
+  constructor() {
+    super("OCR queue is shutting down");
+    this.name = "OcrShutdownError";
+  }
+}
+
 export class OcrQueue {
   private readonly pending: OcrJob[] = [];
   private readonly active = new Map<string, AbortController>();
@@ -116,7 +124,7 @@ export class OcrQueue {
     this.pending.length = 0;
     // A job in flight is aborted rather than awaited to completion: its record
     // goes back to "pending" on the failure path, so the next start re-runs it.
-    for (const controller of this.active.values()) controller.abort();
+    for (const controller of this.active.values()) controller.abort(new OcrShutdownError());
     while (this.active.size || this.pumping)
       await new Promise((resolve) => setTimeout(resolve, 10));
   }

@@ -241,17 +241,24 @@ export class Store {
     );
     return result.rows.map((row) => row.data as { owner: string; value: T });
   }
-  async claim<T>(owner: string, id: string, status: string, now: string): Promise<T | null> {
+  async claim<T>(
+    owner: string,
+    id: string,
+    status: string,
+    now: string,
+    hash: string,
+  ): Promise<T | null> {
     const result = await this.db.query(
       `UPDATE records AS action SET data=jsonb_set(data,'{status}',$4::jsonb),updated_at=now()
        WHERE owner=$1 AND kind='actions' AND id=$2 AND data->>'status'='awaiting_review'
+       AND data->>'hash'=$5
        AND data->>'expiresAt' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$'
        AND safe_timestamptz(data->>'expiresAt')>$3::timestamptz
        AND ($4::jsonb <> '"executing"'::jsonb OR data->>'taskId' IS NULL OR EXISTS (
          SELECT 1 FROM records task WHERE task.owner=action.owner AND task.kind='tasks'
          AND task.id=action.data->>'taskId' AND task.data->>'status' IN ('running','waiting_approval')
        )) RETURNING data`,
-      [owner, id, now, JSON.stringify(status)],
+      [owner, id, now, JSON.stringify(status), hash],
     );
     return (result.rows[0]?.data as T | undefined) ?? null;
   }

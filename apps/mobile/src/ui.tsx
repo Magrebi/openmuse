@@ -24,7 +24,9 @@ import type { MascotSignals } from "./mascot.ts";
 import { AnimatedMascot } from "./mascot.tsx";
 import { durations, springs } from "./motion.ts";
 import {
+  interpolateFrame,
   restFrame,
+  settledFrame,
   type SharedFrame,
   type Rect as SharedRect,
   startFrame,
@@ -424,15 +426,18 @@ export function Sheet({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [origin, panelStyle, progress, window]);
 
-  const animatedPanel = useAnimatedStyle(() => ({
-    opacity: panelStyle.value.opacity,
-    transform: [
-      { translateX: panelStyle.value.translateX },
-      { translateY: panelStyle.value.translateY },
-      { scaleX: panelStyle.value.scaleX },
-      { scaleY: panelStyle.value.scaleY },
-    ],
-  }));
+  const animatedPanel = useAnimatedStyle(() => {
+    const frame = interpolateFrame(panelStyle.value, settledFrame(), progress.value);
+    return {
+      opacity: frame.opacity,
+      transform: [
+        { translateX: frame.translateX },
+        { translateY: frame.translateY },
+        { scaleX: frame.scaleX },
+        { scaleY: frame.scaleY },
+      ],
+    };
+  });
   const shade = useAnimatedStyle(() => ({ opacity: progress.value }));
 
   return (

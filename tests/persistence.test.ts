@@ -250,25 +250,46 @@ test("claim never lets an unusable expiresAt through or abort the statement", as
     const now = new Date().toISOString();
     const future = new Date(Date.now() + 600_000).toISOString();
     const past = new Date(Date.now() - 600_000).toISOString();
-    await db.put("owner", "actions", { id: "live", status: "awaiting_review", expiresAt: future });
-    await db.put("owner", "actions", { id: "missing", status: "awaiting_review" });
+    await db.put("owner", "actions", {
+      id: "live",
+      status: "awaiting_review",
+      hash: "review-hash",
+      expiresAt: future,
+    });
+    await db.put("owner", "actions", {
+      id: "missing",
+      status: "awaiting_review",
+      hash: "review-hash",
+    });
     await db.put("owner", "actions", {
       id: "garbage",
       status: "awaiting_review",
+      hash: "review-hash",
       expiresAt: "not-a-date",
     });
-    await db.put("owner", "actions", { id: "stale", status: "awaiting_review", expiresAt: past });
+    await db.put("owner", "actions", {
+      id: "stale",
+      status: "awaiting_review",
+      hash: "review-hash",
+      expiresAt: past,
+    });
 
     // A well-formed, unexpired action still claims exactly as before.
-    const live = await db.claim<{ status: string }>("owner", "live", "executing", now);
+    const live = await db.claim<{ status: string }>(
+      "owner",
+      "live",
+      "executing",
+      now,
+      "review-hash",
+    );
     assert.equal(live?.status, "executing");
 
     // An unusable expiry must not claim, and must not abort the statement for
     // every other row: the cast used to raise and surface as an opaque 502.
-    assert.equal(await db.claim("owner", "missing", "executing", now), null);
-    assert.equal(await db.claim("owner", "garbage", "executing", now), null);
+    assert.equal(await db.claim("owner", "missing", "executing", now, "review-hash"), null);
+    assert.equal(await db.claim("owner", "garbage", "executing", now, "review-hash"), null);
     assert.equal(
-      await db.claim("owner", "stale", "executing", now),
+      await db.claim("owner", "stale", "executing", now, "review-hash"),
       null,
       "expired rows never claim",
     );

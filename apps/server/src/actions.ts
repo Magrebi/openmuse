@@ -208,9 +208,24 @@ export class ActionService {
       kind: proposal.kind,
       data: { ...proposal.data, ...patch },
     });
-    const connection = await this.options.connection?.(owner);
+    const connection = await this.options.connection?.(owner, proposal.kind);
     if (this.options.connection && !connection)
-      throw new AppError("Connect Google before preparing an action", 409);
+      throw new AppError(
+        proposal.kind === "casaos.action"
+          ? "Connect CasaOS before preparing an action"
+          : "Connect Google before preparing an action",
+        409,
+      );
+    if (
+      connection &&
+      (connection.id !== proposal.connectionId || connection.account !== proposal.account)
+    )
+      throw new AppError(
+        proposal.kind === "casaos.action"
+          ? "CasaOS connection changed. Prepare a new action."
+          : "Google account or connection changed. Prepare a new action for the connected account.",
+        409,
+      );
     // Re-prepared rather than reused: a calendar update's target version is the
     // event's own version, and it must describe the event as it is now, not as
     // it was when the agent first drafted this.
@@ -308,10 +323,13 @@ export class ActionService {
       id,
       decision === "deny" ? "denied" : "executing",
       new Date(this.now()).toISOString(),
+      hash,
     );
     if (!claimed) {
       const current = await this.db.get<ActionProposal>(owner, "actions", id);
       if (!current) throw new AppError("Action not found", 404);
+      if (current.hash !== hash)
+        throw new AppError("This proposal changed. Open its latest review before deciding.", 409);
       // Losing the claim normally means a concurrent decision already moved this
       // action on, and `current` is then that newer record. A record still waiting
       // for review means the claim never matched the stored row at all, and

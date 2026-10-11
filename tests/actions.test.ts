@@ -465,3 +465,88 @@ test("an amendment re-prepares so the target version is current", async () => {
   });
   assert.equal(amended.targetVersion, "v2", "the edit must see the current version");
 });
+
+for (const decision of ["approve", "deny"] as const) {
+  test(`an amendment before the atomic ${decision} claim rejects the old hash`, async () => {
+    const entered = deferred<void>();
+    const release = deferred<void>();
+    const originalClaim = db.claim.bind(db);
+    let intercept = true;
+    let executions = 0;
+    const owner = `amend-before-${decision}`;
+    const service = new ActionService(db, {
+      connected: async () => true,
+      execute: async () => {
+        executions++;
+        return "sent";
+      },
+    });
+    const proposal = await service.propose(owner, email);
+    db.claim = async (...args) => {
+      if (intercept && args[0] === owner) {
+        intercept = false;
+        entered.resolve();
+        await release.promise;
+      }
+      return originalClaim(...args);
+    };
+    try {
+      const deciding = service.decide(owner, proposal.id, proposal.hash, decision);
+      const rejection = assert.rejects(deciding, /proposal changed/i);
+      await entered.promise;
+      const amended = await service.amend(owner, proposal.id, proposal.hash, {
+        to: ["changed@example.com"],
+      });
+      release.resolve();
+      await rejection;
+      const saved = await db.get<ActionProposal>(owner, "actions", proposal.id);
+      assert.equal(saved?.status, "awaiting_review");
+      assert.equal(saved?.hash, amended.hash);
+      assert.equal(executions, 0);
+      await service.decide(owner, proposal.id, amended.hash, "approve");
+      assert.equal(executions, 1);
+    } finally {
+      release.resolve();
+      db.claim = originalClaim;
+    }
+  });
+}
+
+test("CasaOS amendments use their own connection and execute the reviewed edit", async () => {
+  let connection: { id: string; account: string } | null = { id: "casa", account: "owner" };
+  let executedAction: unknown;
+  const service = new ActionService(db, {
+    connected: async () => true,
+    connection: async (_, kind) => {
+      assert.equal(kind, "casaos.action", "Google must not be selected for this action");
+      return connection;
+    },
+    execute: async (_, input, connectionId) => {
+      assert.equal(connectionId, "casa");
+      assert.ok(input.kind === "casaos.action");
+      executedAction = input.data.action;
+      return "stopped";
+    },
+  });
+  const proposal = await service.propose("casa-amend", {
+    kind: "casaos.action",
+    data: { app: "plex", action: "start" },
+  });
+  connection = null;
+  await assert.rejects(
+    service.amend("casa-amend", proposal.id, proposal.hash, { action: "stop" }),
+    /connect CasaOS/i,
+  );
+  connection = { id: "replacement", account: "owner" };
+  await assert.rejects(
+    service.amend("casa-amend", proposal.id, proposal.hash, { action: "stop" }),
+    /CasaOS connection changed/i,
+  );
+  connection = { id: "casa", account: "owner" };
+  const amended = await service.amend("casa-amend", proposal.id, proposal.hash, { action: "stop" });
+  assert.equal(amended.connectionId, proposal.connectionId);
+  assert.equal(amended.account, proposal.account);
+  const result = await service.decide("casa-amend", proposal.id, amended.hash, "approve");
+  assert.equal(result.status, "succeeded");
+  assert.equal(executedAction, "stop");
+});

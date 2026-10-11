@@ -33,7 +33,7 @@ import {
 } from "./library-format.ts";
 import { backgroundFailure } from "./log.ts";
 import { parseLanguages, recognise, recogniseScannedPdf, TEXT_LAYER_THRESHOLD } from "./ocr.ts";
-import type { OcrQueue } from "./ocr-queue.ts";
+import { type OcrQueue, OcrShutdownError } from "./ocr-queue.ts";
 
 /**
  * The formats that always produce text without OCR, and the ones OCR can read.
@@ -655,11 +655,17 @@ export class LibraryService {
   ): Promise<void> {
     const existing = await this.db.get<LibraryDocument>(owner, DOCS, id);
     if (!existing) return;
-    await this.db.put(owner, DOCS, {
-      ...existing,
-      extraction,
-      ...(ocr === undefined ? {} : { ocr }),
-    });
+    // An OCR completion must not recreate a document deleted after this read.
+    await this.db.compareAndSwap(
+      owner,
+      DOCS,
+      id,
+      { ...existing },
+      {
+        extraction,
+        ...(ocr === undefined ? {} : { ocr }),
+      },
+    );
   }
 
   /**
@@ -721,6 +727,8 @@ export class LibraryService {
         document.mimeType === "application/pdf"
           ? await this.ocrPdf(path, languages, signal)
           : await this.ocrImage(path, languages, signal);
+      // A cancelled PDF recognizer may return partial text rather than throw.
+      signal.throwIfAborted();
       if (!text.text.trim()) {
         // No text is a failure, not an empty success: the owner asked for a
         // searchable document and did not get one, and `failed` says so.
@@ -741,6 +749,8 @@ export class LibraryService {
       await this.setExtraction(owner, id, "ready", text.ocr);
       return { text: text.text, truncated: text.truncated, ocr: text.ocr };
     } catch (error) {
+      if (signal.aborted && signal.reason instanceof OcrShutdownError)
+        return { text: "", truncated: false, ocr: true };
       backgroundFailure(`ocr ${id}`, error);
       await this.db.remove(owner, TEXTS, id).catch(() => {});
       await this.setExtraction(owner, id, "failed").catch(() => {});
